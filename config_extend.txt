@@ -1,0 +1,63 @@
+Num_trucks(TR): 20
+Num_shovels(SH): 3
+Num_crushers(CR): 4
+Num_dumps(DS): 2
+
+%Truck to Crusher  probability (Stripping Ratio)
+epsilon: 0.8
+scheduler_choice: 3
+
+%Target in Tons 
+target_pvol(PVol_targ): 20000
+
+% Operation cost (AUD)
+known_cost: Uniform Min: 23254, Max: 30000
+estimated_cost: Uniform Min: 8000, Max: 10000
+
+% Truck Fuel consumption (with Waste, Ore or Empty) in Litres
+truck_waste(FW): Normal (0.25,0.001)
+truck_ore(FO): Normal (0.25,0.001)
+truck_empty(FE): Normal (0.35,0.001)
+
+% Truck Weight (with waste, Ore or Empty) in Tons
+Truck Waste (LW): Normal (105, 7.5)
+Truck Ore (LO): Normal (95, 7.5)
+Truck Empty (LE): Normal (5, 2.5)
+
+% Truck speed (when empty and when loaded) in Km/hr
+truck_empty(TE): Normal (40,60)
+truck_loaded(TL): Normal (25,40)
+
+% Mean time between Failure in minutes (MTBF)in mins
+Shovel(FSH): Poisson (2520) 
+Truck(FTR): Poisson (2160)
+Crusher(FCR): Poisson (30000)
+Dumping_site(FDS): Poisson (60000)
+
+% Mean time to repair in minutes (MTTR) in mins
+Shovel(RSH): Poisson (240) 
+Truck(RTR): Poisson (300) 
+Crusher(RCR): Poisson (240) 
+Dumping_site(RDS): Poisson(120) 
+
+% Loading and other time (mins)
+truck_loading(TRL): Normal (8,2)
+dump_to_shovel(DTS): Normal (15, 5)
+shovel_to_dump(STD): Normal (15, 5)
+truck_dumping_dmp(TRDM): Normal (15, 1)
+crusher_to_shovel(CTS): Normal (15, 2)
+shovel_to_crusher(STC): Normal (15, 2)
+truck_dumping_crush(TRCR): Normal (15, 1)
+
+%Shift duration in minutes
+Num_shifts(SN):10
+Shift_duration(Sdur):720
+
+%Experiementation Scenario parameters 
+%STF <= SH and TTF>TR
+shovels_to_fail(STF): Binomial (2, 0.5)
+trucks_to_fail(TTF): Binomial (6, 0.5) 
+%shovels_to_fail(STF): 1
+%trucks_to_fail(TTF): 0
+shovel_initial_breakdown(SIB): Uniform Min: 100, Max: 300
+truck_initial_breakdown(TIB): Uniform Min: 100, Max: 500
