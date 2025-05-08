@@ -1,5 +1,6 @@
 # Mining-Gym
 Mining-Gym is an open-source, configurable benchmarking environment for optimizing truck dispatch scheduling in open-pit mining using Reinforcement Learning (RL).
+The paper with all the details can be found here https://doi.org/10.48550/arXiv.2503.19195
 
 ## Repository Files
 
