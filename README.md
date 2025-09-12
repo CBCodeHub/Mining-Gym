@@ -33,6 +33,6 @@ python mgym_GymRun.py play --num_episodes 5 --model_path <path_to_saved_model.zi
 Replace <path_to_saved_model.zip> with the actual path to your saved model.
 
 5. **To change configuration data:**  
-You can modify the simulation settings by editing the config.extend.txt file. This allows you to adjust parameters such as environment details, scheduler settings, and other simulation-related options.
+You can modify the simulation settings by editing the config_extend.txt file. This allows you to adjust parameters such as environment details, scheduler settings, and other simulation-related options.
 
 
