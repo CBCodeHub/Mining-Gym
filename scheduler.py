@@ -1,67 +1,75 @@
-'''
-Contains definitions for Rule-based or classical scheduling algorithms.
-'''
 import random
 import time
 from collections import deque
 import gymnasium as gym
 from gymnasium.spaces import Discrete
 import json
+import os  # ADD THIS - missing import!
 
 class DefaultScheduler:
-
     def random_sel(self, shvl):
-        """
-        Choose randomly
-        """
+        """Choose randomly"""
         print('Seeking random')
-        #random.seed((time.time()))
         svl = random.choice(shvl)
         print(svl)
         return svl
     
-    
-    def fixed(self, num_trucks, num_shovels, rsd, fxctr, truck_id = 0):
+    def fixed(self, truck_id, num_trucks, shovels):
         """
-        Schedule tasks in a fixed order. Tasks are scheduled in the order they were added.
+        Fixed allocation scheduler using round-robin.
+        - First call: Generates LUT for ALL trucks (round-robin allocation)
+        - Subsequent calls: Looks up truck_id and returns assigned shovel
         """
-        #random.seed(rsd)
         allocation_file = 'alloc.json'
-
-        if fxctr == 0:
-            """ Create allocation schedule oncein the start"""
-            # Create list of truck IDs as integers
-            trucks = [i + 1 for i in range(num_trucks)]
-            shovels = [i + 1 for i in range(num_shovels)]  # assuming shovels are numbered 1 to num_shovels
-
-            # Allocate shovels to trucks using round-robin allocation
+        num_shovels = len(shovels)
+        
+        # Check if allocation LUT exists
+        if not os.path.exists(allocation_file):
+            # First call - Generate complete LUT for all trucks
             allocation = {}
-            for i, truck in enumerate(trucks):
-                shovel = shovels[i % num_shovels]
-                allocation[truck] = shovel
-
-            # Save allocation to a JSON file, replacing old one if it exists
+            for truck_num in range(1, num_trucks + 1):
+                shovel_idx = (truck_num - 1) % num_shovels
+                allocation[str(truck_num)] = shovel_idx  # Store index (0-based)
+            
+            # Save LUT to file
             with open(allocation_file, 'w') as f:
                 json.dump(allocation, f)
+            print(f"Fixed scheduler: Created allocation LUT for {num_trucks} trucks and {num_shovels} shovels")
+        else:
+            # Subsequent calls - Load existing LUT
+            with open(allocation_file, 'r') as f:
+                allocation = json.load(f)
         
-        else:
-            # Load existing allocation from JSON file
-            if os.path.exists(allocation_file):
-                with open(allocation_file, 'r') as f:
-                    allocation = json.load(f)
-            else:
-                raise FileNotFoundError("Allocation file not found. Set fxctr to 0 to generate a new allocation.")
-
-        # Return the allocated shovel for the given truck_id
-        allocated_shovel = allocation.get(str(truck_id), None)  # truck_id is a string in JSON
-        if allocated_shovel is not None:
-            return allocated_shovel
-        else:
-            return None
-
+        # Look up shovel index for this specific truck
+        shovel_idx = allocation.get(str(truck_id), 0)
+        
+        # Return the actual shovel OBJECT (not the index)
+        allocated_shovel = shovels[shovel_idx]
+        print(f"Truck {truck_id} assigned to {allocated_shovel.name()}")
+        return allocated_shovel
+    
     def shortest_queue(self, shovels):
-        """ Schedule the task from the queue with the shortest waiting time."""
-        best_shovel = min(shovels, key=lambda shovel: len(shovel.requesters()))
-        print(best_shovel)
-        #time.sleep(10)
-        return best_shovel
+        """
+        Return shovel with shortest TOTAL queue (requesters + claimers).
+        Uses random tie-breaking to prevent herding.
+        """
+        # Include both waiting trucks AND currently loading trucks
+        def total_load(shovel):
+            return len(shovel.requesters()) + len(shovel.claimers())
+            
+        # Find the minimum total load across all shovels
+        min_load = min(total_load(s) for s in shovels)
+        
+        # Select all shovels that match the minimum load (for tie-breaking)
+        best_shovels = [s for s in shovels if total_load(s) == min_load]
+        
+        # Randomly choose one of the best shovels
+        selected = random.choice(best_shovels)
+        
+        # Print diagnostic logging
+        print(f"Shortest queue selected: {selected.name()} "
+              f"(load={total_load(selected)}, "
+              f"requesters={len(selected.requesters())}, "
+              f"claimers={len(selected.claimers())})")
+
+        return selected

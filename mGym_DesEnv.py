@@ -1,5 +1,5 @@
-'''
-Representing the Mining Load and Haul Cycle using Discrete Event Simulation in  Salabim 
+﻿'''
+Representing the Mining Load and Haul Cycle using Discrete Event Simulation in  Salabim (BOTTOM of 3)
 '''
 
 from pickle import FALSE
@@ -31,30 +31,37 @@ from datetime import datetime
 # Global lock for CSV operations
 csv_lock = threading.Lock()
 
+'''
+Previous version DES_comm_03
+'''
+
 update_freq = 20 #10 units of time
 shift_start_time = 0
-all_trk_shv_dec = deque(maxlen=100)
+all_trk_shv_dec = None 
 
-cfg_samp = ConfigSampler('config_extend.txt')#, cnfg_seed = cnfg_seed) #load from configuration file
+cfg_samp = ConfigSampler('config_extend_review.txt') #, cnfg_seed = cnfg_seed) #load from configuration file
+cfg_samp.episode_count = 0
+#cfg_samp = ConfigSampler('config_extend.txt', time_scale=5.0)
+#time_scale = 5
 
-# Basic parameters loaded from config
-Num_trucks = cfg_samp.get_sampled_value('TR')
-Num_shovels = cfg_samp.get_sampled_value('SH')
-Num_crushers = cfg_samp.get_sampled_value('CR') 
-Num_dumps = cfg_samp.get_sampled_value('DS')
-Num_shifts = cfg_samp.get_sampled_value('SN')
-shift_dura = cfg_samp.get_sampled_value('Sdur')
-targ_pvol = cfg_samp.get_sampled_value('PVol_targ')
+# Fixed parameters loaded from config (cached, same across episodes)
+Num_trucks = None 
+Num_shovels = None
+Num_crushers = None 
+Num_dumps = None 
+shift_dura = None 
+targ_pvol = None 
+load_per_trip = None
+choice = None 
 
-load_per_trip = cfg_samp.get_sampled_value('LO') #only consider loaded truck
+# Episodic parameters (will be updated in runDes for each episode)
+epsilon = 0.35  # Default value, updated in runDes()
 
 
-file_path = 'envDes_shrd.csv'
+#file_path = 'envDes_shrd.csv'
 RL_sched = True # initializing the flag
 def_schdlr_choice = None
 
-choice = cfg_samp.get_sampled_value('scheduler_choice')
-epsilon = cfg_samp.get_sampled_value('epsilon')
 
 r_optimal = (1-epsilon)/epsilon #used for calculating waste trip balance
 
@@ -87,16 +94,11 @@ sim_exit = False
 total_crush_trips = 0  # Initialize total dump trips counter
 
 
+
 # Add this global variable to keep track of trips
 truck_trip_counts = {}
 truck_phases = {}  # Dictionary to track truck phases
 
-# Dictionaries to track the total waiting time and number of requests for each shovel
-shovel_waiting_times = {f"Shovel_{i}": 0 for i in range(Num_shovels)}
-shovel_request_counts = {f"Shovel_{i}": 0 for i in range(Num_shovels)}
-
-# Global variable to track the last completed trip time for each truck
-truck_last_trip_times = {}
 
 
 # Deque manipulation code
@@ -104,26 +106,36 @@ def add_item(item):
     # Make the deque global to allow modifications
     global all_trk_shv_dec
     all_trk_shv_dec.append(item)
-    print(f"Updated deque: {all_trk_shv_dec}")
+    #print(f"Updated deque: {all_trk_shv_dec}")
 
 def diversity_score() -> float:
-    global all_trk_shv_dec
-    trk_shv_dec = deque(list(all_trk_shv_dec)[-6:])  # Get last 5 elements
+    """
+    Calculate diversity using Shannon entropy (ORIGINAL version).
+    NO recency weighting - that made it worse!
+    """
+    global all_trk_shv_dec, Num_shovels, Num_trucks
     
-    if not trk_shv_dec:
-        return 1.0  # Default value if empty
+    #window_size = min(Num_trucks * 2, len(all_trk_shv_dec))
+    window_size = min(30, len(all_trk_shv_dec)) 
+    trk_shv_dec = deque(list(all_trk_shv_dec)[-window_size:])
     
-    unique_choices = len(set(trk_shv_dec))  # Count unique elements in last 5
-    
-    # Find the max possible unique elements in the dataset
-    max_possible_unique = Num_shovels #len(set(all_trk_shv_dec))  # Consider all unique values present
-
-    # Avoid division by zero
-    if max_possible_unique == 0:
+    if len(trk_shv_dec) < Num_shovels:
         return 1.0
     
-    # Normalize the score
-    return unique_choices / max_possible_unique
+    # Simple Shannon entropy over full window
+    counts = Counter(trk_shv_dec)
+    total = len(trk_shv_dec)
+    entropy = 0
+    for count in counts.values():
+        if count > 0:
+            p = count / total
+            entropy -= p * np.log2(p + 1e-10)
+    
+    max_entropy = np.log2(Num_shovels)
+    normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
+    
+    return normalized_entropy
+
 
 def calculate_shovel_imbalance(shovels):
     global all_trk_shv_dec
@@ -149,9 +161,31 @@ def calculate_shovel_imbalance(shovels):
     # The imbalance score is the difference between the max and min counts
     imbalance = max_count - min_count
     
-    return imbalance
+    # ADD THESE 2 LINES:
+    zero_usage_count = sum(1 for count in shovel_counts.values() if count == 0)
+    starvation_penalty = zero_usage_count * (total_shovels / Num_shovels)
+    
+    return imbalance + starvation_penalty
 
 
+def calculate_streak_penalty() -> float:
+    """
+    Direct penalty for consecutive same-shovel decisions.
+    Returns value in [0, 1] where higher = worse streaking.
+    """
+    global all_trk_shv_dec
+    
+    if len(all_trk_shv_dec) < 15:
+        return 0.0
+    
+    # Look at last 15 decisions
+    recent = list(all_trk_shv_dec)[-15:]
+    
+    # Count how many consecutive same choices
+    same_count = sum(1 for i in range(1, len(recent)) if recent[i] == recent[i-1])
+    streak_ratio = same_count / (len(recent) - 1)
+    
+    return streak_ratio
 
 def scheduler_assign(choice, truck_id=None):
     '''
@@ -169,11 +203,98 @@ def scheduler_assign(choice, truck_id=None):
         # Shortest Queue
         scheduled_equip = def_scheduler.shortest_queue(shovels)
     else:
-        raise ValueError("Choice must be between 1 and 4")
+        raise ValueError("Choice must be 1, 2 or 3")
      
     # Return the updated values of all variables
     return scheduled_equip
 
+def print_episode_summary():
+    """Print brief episode summary for debugging"""
+    try:
+        print(f"Episode {cfg_samp.episode_count}: epsilon={cfg_samp.get_sampled_value('Eps'):.3f}")
+        
+        # Show if we have shovel classes (indicates heterogeneous setup)
+        try:
+            classes = cfg_samp.get_sampled_value('shovel_performance_class')
+            clusters = cfg_samp.get_sampled_value('shovel_location_cluster')
+            print(f"  Shovel classes: {classes}")
+            print(f"  Location clusters: {clusters}")
+        except KeyError:
+            print("  Using homogeneous shovel configuration")
+        
+        # Infrastructure-based parameters
+        try:
+            sz1c = cfg_samp.get_sampled_value('SZ1C')
+            sz1d = cfg_samp.get_sampled_value('SZ1D')
+            sz2c = cfg_samp.get_sampled_value('SZ2C')
+            sz2d = cfg_samp.get_sampled_value('SZ2D')
+            sz3c = cfg_samp.get_sampled_value('SZ3C')
+            sz3d = cfg_samp.get_sampled_value('SZ3D')
+            print(f"  Infrastructure (SZ): Zone1-Crush: {sz1c:.2f}, Zone1-Dump: {sz1d:.2f}")
+            print(f"    Zone2-Crush: {sz2c:.2f}, Zone2-Dump: {sz2d:.2f}")
+            print(f"    Zone3-Crush: {sz3c:.2f}, Zone3-Dump: {sz3d:.2f}")
+        except KeyError:
+            pass # Silent fail if these aren't in the config
+
+        # Equipment-specific operational parameters
+        try:
+            trdm = cfg_samp.get_sampled_value('TRDM')
+            trcr = cfg_samp.get_sampled_value('TRCR')
+            print(f"  Equipment Dump Times: Truck-Dump: {trdm:.2f}, Truck-Crush: {trcr:.2f}")
+        except KeyError:
+            pass
+
+        # Base reliability parameters
+        try:
+            rsh = cfg_samp.get_sampled_value('RSH')
+            rtr = cfg_samp.get_sampled_value('RTR')
+            rcr = cfg_samp.get_sampled_value('RCR')
+            rds = cfg_samp.get_sampled_value('RDS')
+            print(f"  Base MTTR: Shovel: {rsh:.2f}, Truck: {rtr:.2f}, Crusher: {rcr:.2f}, Dump: {rds:.2f}")
+        except KeyError:
+            pass
+            
+        # Cost parameters
+        try:
+            known_cost = cfg_samp.get_sampled_value('known_cost')
+            estimated_cost = cfg_samp.get_sampled_value('estimated_cost')
+            print(f"  Cost Parameters: Known: {known_cost:.2f}, Estimated: {estimated_cost:.2f}")
+        except KeyError:
+            pass
+
+        # Equipment performance variations
+        try:
+            trl_c1 = cfg_samp.get_sampled_value('TRL_C1')
+            trl_c2 = cfg_samp.get_sampled_value('TRL_C2')
+            trl_c3 = cfg_samp.get_sampled_value('TRL_C3')
+            print(f"  Loading Times: Class1: {trl_c1:.2f}, Class2: {trl_c2:.2f}, Class3: {trl_c3:.2f}")
+        except KeyError:
+            pass
+
+        # Daily operational conditions
+        try:
+            fw = cfg_samp.get_sampled_value('FW')
+            fo = cfg_samp.get_sampled_value('FO')
+            fe = cfg_samp.get_sampled_value('FE')
+            te = cfg_samp.get_sampled_value('TE')
+            tl = cfg_samp.get_sampled_value('TL')
+            print(f"  Fuel Consumptions: Waste: {fw:.2f}, Ore: {fo:.2f}, Empty: {fe:.2f}")
+            print(f"  Truck Speeds: Empty: {te:.2f}, Loaded: {tl:.2f}")
+        except KeyError:
+            pass
+            
+        # Equipment health status
+        try:
+            fsh = cfg_samp.get_sampled_value('FSH')
+            ftr = cfg_samp.get_sampled_value('FTR')
+            fcr = cfg_samp.get_sampled_value('FCR')
+            fds = cfg_samp.get_sampled_value('FDS')
+            print(f"  Equipment MTBF: Shovel: {fsh:.2f}, Truck: {ftr:.2f}, Crusher: {fcr:.2f}, Dump: {fds:.2f}")
+        except KeyError:
+            pass
+            
+    except KeyError as e:
+        print(f"Episode summary error: {e}")
 
 #------------CSV Updating -----------------------------------------------------------------------#
 #------------Write back Immediate and Final reward and corresponding Observed state vector-------#
@@ -328,57 +449,102 @@ def get_shovel_from_integer(shovel_list, index):
         return None
 
 
-def create_observation(num_shovels, num_trucks, shovel_data, truck_data):
+def create_observation(num_shovels, num_trucks, shovel_data, active_truck_data, fleet_summary):
     '''
-    Takes dictionaries of shovel_data and truck_data returns formatted observation vector for Gym
+    Takes dictionaries of shovel_data, active_truck_data, and fleet_summary
+    Returns formatted observation vector for Gym with fleet context
+    
+    Args:
+        num_shovels: Number of shovels in the mine
+        num_trucks: Total number of trucks in the fleet
+        shovel_data: List of tuples [(queue_len, status), ...] for each shovel
+        active_truck_data: Dict with single truck's data {truck_name: {'trip_count': X, 'phase': 'XXX'}}
+        fleet_summary: Dict with {'avg_trips': float, 'recent_decisions': deque, 'diversity_score': float}
+    
+    Returns:
+        observation: Dict with all observation components as lists
     '''
-    # Initialize arrays
-    shovel_id = np.zeros(num_shovels * 3, dtype=int)
+    
+    # --- SHOVEL STATE ---
+    shovel_id = np.zeros(num_shovels * 4, dtype=int)
     queue_length = np.zeros(num_shovels, dtype=float)
     sh_status = np.zeros(num_shovels, dtype=int)
     
-    # Populate shovel data
+    # Populate shovel data with bounded normalization
     for i, (queue_len, status) in enumerate(shovel_data):
-        queue_length[i] = round(queue_len/ num_trucks, 4)
+        # FIX: Bounded queue normalization (handles extreme congestion)
+        max_queue = num_trucks * 2
+        queue_length[i] = round(min(queue_len / max_queue, 1.0), 4)
         sh_status[i] = status
-        # Convert the index i to a 3-bit binary string
-        bin_str = format(i + 1, '03b')
-        # Unpack each bit into separate positions in the shovel_id array
-        shovel_id[i * 3:i * 3 + 3] = list(map(int, bin_str))
-    
-    truck_id = np.zeros(num_trucks * 5, dtype=int)
-    trips_complete = np.zeros(num_trucks, dtype=float)
-    tr_status = np.zeros(num_trucks * 3, dtype=int)
-    
-    # Populate truck data
-    for truck_key, truck_info in truck_data.items():
-        trip_count = truck_info['trip_count']
-        phase = truck_info['phase']
- 
-        # Extract the integer index from the truck_key and convert it to a 5-bit binary equivalent
-        truck_index = int(truck_key.split('.')[1]) - 1  # Adjust index to be 0-based
-        binary_index = f'{truck_index + 1:05b}'  # Format as 5-bit binary string
-
-        # Update trips_complete with the trip count for the truck
-        trips_complete[truck_index] = round(trip_count/ 500, 4)
         
-        # Convert the phase string directly into a list of integers (treating it as a binary string)
-        phase_list = [int(char) for char in phase]  # Convert each character in the phase string to an integer
+        # Binary encoding of shovel ID (4 bits supports up to 16 shovels)
+        bin_str = format(i + 1, '04b')
+        shovel_id[i * 4:i * 4 + 4] = list(map(int, bin_str))
 
-        # Ensure the truck_id array can accommodate the new values
-        truck_id[truck_index * 5:truck_index * 5 + 5] = list(map(int, binary_index))
- 
-        # Assign the phase list to tr_status
-        tr_status[truck_index * 3:truck_index * 3 + 3] = phase_list
+    # --- ACTIVE TRUCK STATE ---
+    truck_id_active = np.zeros(1 * 6, dtype=int) 
+    trips_complete_active = np.zeros(1, dtype=float)
+    tr_status_active = np.zeros(1 * 3, dtype=int)
+
+    # Extract the single active truck's data
+    truck_key = list(active_truck_data.keys())[0]
+    truck_info = active_truck_data[truck_key]
     
-    # Create and return the observation dictionary
+    # Parse truck information
+    trip_count = truck_info['trip_count']
+    phase = truck_info['phase']
+    truck_index = int(truck_key.split('.')[1]) - 1
+    
+    # Binary encoding of truck ID (6 bits supports up to 64 trucks)
+    binary_index = f'{truck_index + 1:06b}'
+    truck_id_active[0:6] = list(map(int, binary_index))
+    
+    # Normalize trip count
+    trips_complete_active[0] = round(trip_count / 500, 4)
+    
+    # Convert phase string to binary list
+    phase_list = [int(char) for char in phase]
+    tr_status_active[0:3] = phase_list
+
+    # --- FLEET CONTEXT (NEW: Essential for coordination) ---
+    
+    # 1. Fleet average trip progress (scalar)
+    fleet_avg_trips = np.zeros(1, dtype=float)
+    fleet_avg_trips[0] = round(fleet_summary['avg_trips'] / 500, 4)
+    
+    # 2. Recent shovel usage distribution (vector showing fleet behavior)
+    recent_shovel_usage = np.zeros(num_shovels, dtype=float)
+    if len(fleet_summary['recent_decisions']) >= 5:
+        # Look at last 10 decisions to see distribution
+        recent_window = list(fleet_summary['recent_decisions'])[-10:]
+        recent_counts = Counter(recent_window)
+        
+        for shovel_name, count in recent_counts.items():
+            # Extract shovel index from name like "Shovel_3"
+            idx = int(shovel_name.split('_')[1])
+            # Normalize by window size to get proportion
+            recent_shovel_usage[idx] = count / len(recent_window)
+    
+    # 3. Fleet diversity score (scalar indicating balance)
+    fleet_diversity = np.zeros(1, dtype=float)
+    fleet_diversity[0] = round(fleet_summary['diversity_score'], 4)
+    
+    # --- CREATE OBSERVATION DICTIONARY ---
     observation = {
-        "ShovelID": shovel_id.tolist(),
-        "Queue_length": queue_length.tolist(),
-        "SH_Status": sh_status.tolist(),
-        "TruckID": truck_id.tolist(),
-        "Trips_complete": trips_complete.tolist(),
-        "TR_Status": tr_status.tolist()
+        # Shovel information
+        "ShovelID": shovel_id.tolist(),                      # num_shovels * 4 binary
+        "Queue_length": queue_length.tolist(),                # num_shovels floats
+        "SH_Status": sh_status.tolist(),                      # num_shovels binary
+        
+        # Active truck information
+        "TruckID_Active": truck_id_active.tolist(),           # 6 binary
+        "Trips_complete_Active": trips_complete_active.tolist(), # 1 float
+        "TR_Status_Active": tr_status_active.tolist(),        # 3 binary
+        
+        # Fleet context (NEW)
+        "Fleet_Avg_Trips": fleet_avg_trips.tolist(),          # 1 float
+        "Recent_Shovel_Usage": recent_shovel_usage.tolist(),  # num_shovels floats
+        "Fleet_Diversity": fleet_diversity.tolist()           # 1 float
     }
     
     return observation
@@ -446,12 +612,21 @@ class RewardCalculator:
         Q_Avg_d = self.compute_weighted_average(self.shovel_queues)
         TT_Avg_norm =  self.min_max_normalize(TT_Avg, self.TT_Avg_min, self.TT_Avg_max)
         Q_Avg_d_norm =  self.min_max_normalize(Q_Avg_d, self.Q_Avg_d_min, self.Q_Avg_d_max)
+
+        # Four-component reward with explicit anti-streak mechanism
+        efficiency_penalty = -0.25 * TT_Avg_norm   # Increased weight (Credit Assignment) 0.15
+        queue_penalty = -0.15 * Q_Avg_d_norm       # Reduced weight (Covered by efficiency)
+        diversity_penalty = -0.30 * (1 - diversity_score())  #0.40
+        streak_penalty = -0.30 * calculate_streak_penalty()  # Reduced weight
         
-        #r_imm_d = - (TT_Avg_norm)  -  (Q_Avg_d_norm)
-        #r_imm_d =  - (TT_Avg_norm) -  (Q_Avg_d_norm) - 4.0*(1-diversity_score())  #)*time_scale
-        r_imm_d =  - 0.33* (TT_Avg_norm) - 0.33* (Q_Avg_d_norm) - 0.34*(1-diversity_score())
-        print(f"Entire deque {all_trk_shv_dec}")
-        print(f"Diversity in Shovel selection {diversity_score()}")
+        r_imm_d = efficiency_penalty + queue_penalty + diversity_penalty + streak_penalty
+
+        if len(all_trk_shv_dec) % 20 == 0:
+            episode_num = cfg_samp.episode_count if hasattr(cfg_samp, 'episode_count') else '?'
+            print(f"[Episode {episode_num}] Step {len(all_trk_shv_dec)}: "
+                  f"Eff: {-efficiency_penalty:.3f}, Queue: {-queue_penalty:.3f}, "
+                  f"Div: {diversity_score():.3f}, Reward: {r_imm_d:.4f}")
+
 
         return {
             'r_imm_d': r_imm_d,
@@ -498,7 +673,7 @@ class ShovelWaitTimeTracker:
         return average_times
 
 # Initialize the tracker
-shovel_wait_time_tracker = ShovelWaitTimeTracker(Num_shovels)
+#shovel_wait_time_tracker = ShovelWaitTimeTracker(Num_shovels)
 
 
 
@@ -509,15 +684,17 @@ class Truck(sim.Component):
     trucks_to_fail = None  # Class variable to store the IDs of trucks that will fail
    
     def setup(self):
-        global RL_sched
-        global def_schdlr_choice
-        global truck_breakdown_manager
-        global Num_trucks  # Add this to access the number of trucks
+        global RL_sched, def_schdlr_choice, truck_breakdown_manager, Num_trucks
+        global truck_last_trip_times
+        global truck_trip_counts  
+        global truck_phases       
 
         self.truck_id = ''.join(filter(str.isdigit, self.name()))  # Extract truck ID
 
         self.trip_count = 0
         self.truck_id = ''.join(filter(str.isdigit, self.name()))  # Extract truck ID
+        #truck_trip_counts[self.name()] = self.trip_count
+        #truck_last_trip_times[self.truck_id] = 0  # Initialize the last trip time for the truck
 
         self.breakdown_display = None  # Initialize display reference as None
 
@@ -537,7 +714,8 @@ class Truck(sim.Component):
         # Initial breakdown time based on TIB (Time to Initial Breakdown)
         #self.next_breakdown_time = cfg_samp.get_sampled_value('TIB')
         self.has_failed = False  # Track if this truck has had its first breakdown
-        self.time_to_repair = cfg_samp.get_sampled_value('RSH')
+        #self.time_to_repair = cfg_samp.get_sampled_value('RSH')
+        self.time_to_repair = cfg_samp.get_sampled_value('RTR')
         self.phase = phase_shovel
         self.last_phase = None
         self.shovel_name = None  # Track the shovel this truck is assigned to
@@ -568,6 +746,7 @@ class Truck(sim.Component):
 
 
     def update_phase(self, new_phase): 
+        global truck_phases
         self.phase = new_phase
         truck_phases[self.name()] = self.phase  # Update truck phase dictionary
         #print(f"Truck {self.name()} phase updated to {self.phase}")  # Debug print
@@ -609,9 +788,10 @@ class Truck(sim.Component):
                         
         while True:
             
-            seed = int(time.time() * 1000) % 4294967296
-            self.env.random_seed(seed)
-            trk_load = cfg_samp.get_sampled_value('TRL') 
+            #seed = int(time.time() * 1000) % 4294967296
+            #self.env.random_seed(seed)
+            #trk_load = cfg_samp.get_sampled_value('TRL') 
+            
             while True:
                 #selected_shovel = random.choice(shovels)
                 curr_truck_id = ''.join(filter(str.isdigit, self.name()))
@@ -620,9 +800,17 @@ class Truck(sim.Component):
 
                 # Decide on the Shovel selection
                 # Truck uses default method for first scheduling round (Shortest Queue length)
-                if (first_trip == True):# and RL_sched == True):
-                    print("\n Default scheduling used \n ")
-                    selected_shovel = scheduler_assign(choice, truck_id=int(curr_truck_id))  
+                # First trip - Classical mode
+                if (first_trip == True and RL_sched == False):
+                    #print(f"\n Non-RL scheduling used: algo_choice={def_schdlr_choice} \n")
+                    selected_shovel = scheduler_assign(def_schdlr_choice, truck_id=int(curr_truck_id))
+                    first_trip = False
+                    add_item(selected_shovel.name())
+    
+                # First trip - RL mode    
+                elif (first_trip == True and RL_sched == True):
+                    #print("\n Default scheduling used for RL first trip \n ")
+                    selected_shovel = scheduler_assign(choice, truck_id=int(curr_truck_id))
                     first_trip = False
                     add_item(selected_shovel.name())
                     
@@ -631,19 +819,32 @@ class Truck(sim.Component):
                     # Here the observation and reward is to be updated to the csv
                     #---immediate reward calculation
                     # Last trip times of each truck in the fleet
-                    tau_d = sum(truck_last_trip_times.values()) / len(truck_last_trip_times) #tau_d, averaged over all trucks
+                    #tau_d = sum(truck_last_trip_times.values()) / len(truck_last_trip_times) #tau_d, averaged over all trucks
+                    tau_d = truck_last_trip_times[curr_truck_id]
+
                     average_waiting_times = shovel_wait_time_tracker.get_average_waiting_times() # Average waiting times at individual shovels at 'current event'
                     Q_SH_d  = sum(average_waiting_times.values()) / len(average_waiting_times) #Q_SH_d, averaged over all the shovels
                     self.reward_calculator.update(tau_d, Q_SH_d) # Update the 'K event sliding window' with the current event data
                     r_dict = self.reward_calculator.compute_r_imm_d()  # Compute the immediate reward at the current decision point
                     r_imm_d_pt= r_dict['r_imm_d']  #Create immediate reward
-                    observ = create_observation(Num_shovels, Num_trucks, print_resource_status(pflag=0)['Shovels'], print_trip_counts(ppflag=0))
 
-                    print('\n tau_d  value: '+str(tau_d))
-                    print('\n Q_SH_d value: '+str(Q_SH_d))
-                    print('\n Immediate reward due to last action : '+str(r_imm_d_pt))
-                    print('\n Observation/ next_state due to last action:'+str(observ))
-                    #info= None
+                    # *** OBSERVATION MISMATCH FIX ***
+                    # Only pass the data for the current truck (self) to create_observation
+                    # print_trip_counts(ppflag=0) returns ALL truck data. We need to filter it.
+                    all_truck_data = print_trip_counts(ppflag=0)
+                    active_truck_data = {self.name(): all_truck_data[self.name()]} # Filter to only the active truck
+
+                    all_trips = list(truck_trip_counts.values())
+                    fleet_summary = {
+                        'avg_trips': sum(all_trips) / len(all_trips) if all_trips else 0,
+                        'recent_decisions': all_trk_shv_dec,  # The global deque
+                        'diversity_score': diversity_score()
+                    }
+
+                    #observ = create_observation(Num_shovels, Num_trucks, print_resource_status(pflag=0)['Shovels'], print_trip_counts(ppflag=0))
+                    observ = create_observation(Num_shovels, Num_trucks, print_resource_status(pflag=0)['Shovels'], active_truck_data,fleet_summary)
+
+
                     info = {'truck_id': curr_truck_id}
 
                     global sim_exit
@@ -680,8 +881,9 @@ class Truck(sim.Component):
                 # Non-RL Scheduling chosen
                 #elif (first_trip is False and RL_sched is False):
                 elif (RL_sched == False):
-                    print(f'Scheduler algo Choice" {def_schdlr_choice}')
+                    #print(f'Scheduler algo Choice" {def_schdlr_choice}')
                     selected_shovel = scheduler_assign(def_schdlr_choice, truck_id=int(curr_truck_id))  
+                    #print(f"[VERIFY] Truck {curr_truck_id} → {selected_shovel.name()} at time {env.now():.2f}")
                     add_item(selected_shovel.name())
 
                                
@@ -691,7 +893,19 @@ class Truck(sim.Component):
 
                 yield self.request((selected_shovel,1,4))
                 start_time = env.now()
+
+                # Get loading time based on selected shovel's performance class
+                try:
+                    shovel_id = int(selected_shovel.name().split('_')[1])
+                    shovel_classes = cfg_samp.get_sampled_value('shovel_performance_class')
+                    performance_class = shovel_classes[shovel_id]
+                    trk_load = cfg_samp.get_sampled_value(f'TRL_C{performance_class}')
+                except (KeyError, IndexError) as e:
+                    print(f"ERROR: Could not get loading time for shovel {selected_shovel.name()}: {e}")
+
+
                 yield self.hold(trk_load)
+
                 if self.isbumped():
                     trk_load -= env.now() - start_time
                     continue
@@ -705,7 +919,15 @@ class Truck(sim.Component):
                 #[Go To CRUSHER]
                 self.update_phase(phase_travel_shovel_crusher) 
                 selected_crusher = random.choice(crushers)  
-                norm_time_cr = cfg_samp.get_sampled_value('STC')  # Travel time to crusher
+                #norm_time_cr = cfg_samp.get_sampled_value('STC')  # Travel time to crusher
+                try:
+                    shovel_id = int(selected_shovel.name().split('_')[1])
+                    location_clusters = cfg_samp.get_sampled_value('shovel_location_cluster')
+                    location_cluster = location_clusters[shovel_id]
+                    norm_time_cr = cfg_samp.get_sampled_value(f'SZ{location_cluster}C')  # Zone to Crusher
+                except (KeyError, IndexError) as e:
+                    print(f"ERROR: Could not get crusher travel time for shovel {selected_shovel.name()}: {e}")
+
                 vmax_rnd_cr = 300 / (norm_time_cr)
                 traj_c01 = sim.TrajectoryCircle(radius=200, x_center=750, y_center=600, angle0=230, angle1=360, v0=0, vmax=vmax_rnd_cr)
 
@@ -752,7 +974,14 @@ class Truck(sim.Component):
                 self.update_phase(phase_travel_crusher_shovel) 
                 
                 #Return to Shovel animate
-                norm_time_rev_cr = cfg_samp.get_sampled_value('CTS') #Crusher to shovel travel time
+                #norm_time_rev_cr = cfg_samp.get_sampled_value('CTS') #Crusher to shovel travel time
+                try:
+                    shovel_id = int(selected_shovel.name().split('_')[1])
+                    location_clusters = cfg_samp.get_sampled_value('shovel_location_cluster')
+                    location_cluster = location_clusters[shovel_id]
+                    norm_time_rev_cr = cfg_samp.get_sampled_value(f'SZ{location_cluster}C')  # Zone to Crusher (return)
+                except (KeyError, IndexError) as e:
+                    print(f"ERROR: Could not get return travel time from crusher: {e}")
                 vmax_rnd_rev_cr = 330/ (norm_time_rev_cr)
                 traj_c02 = sim.TrajectoryCircle(radius=230, x_center=750, y_center=600, angle0=330, angle1=230, v0 = 0, vmax  = vmax_rnd_rev_cr)
                 self.dump_truck_cr_2 = sim.AnimateImage("dump_truck_02.png", width=70, x=traj_c02.x, y=traj_c02.y,angle=traj_c02.angle,text=str(num), text_anchor = "c", fontsize= 20, textcolor = "red")
@@ -770,7 +999,14 @@ class Truck(sim.Component):
 
                 selected_dump = random.choice(dumps)
                 # Define trajectory for traveling to a dump
-                norm_time = cfg_samp.get_sampled_value('STD')  # Travel to dump time
+                #norm_time = cfg_samp.get_sampled_value('STD')  # Travel to dump time
+                try:
+                    shovel_id = int(selected_shovel.name().split('_')[1])
+                    location_clusters = cfg_samp.get_sampled_value('shovel_location_cluster')
+                    location_cluster = location_clusters[shovel_id]
+                    norm_time = cfg_samp.get_sampled_value(f'SZ{location_cluster}D')  # Zone to Dump
+                except (KeyError, IndexError) as e:
+                    print(f"ERROR: Could not get dump travel time for shovel {selected_shovel.name()}: {e}")
                 vmax_rnd = 830 / norm_time
                 traj_03 = sim.TrajectoryCircle(radius=230, x_center=300, y_center=470, angle0=360, angle1=150, vmax=vmax_rnd)
 
@@ -813,7 +1049,14 @@ class Truck(sim.Component):
                 
                 #Return to Shovel animate
                 #norm_time_rev = max(1,sim.Normal(40,10).sample())
-                norm_time_rev = cfg_samp.get_sampled_value('DTS')
+                #norm_time_rev = cfg_samp.get_sampled_value('DTS')
+                try:
+                    shovel_id = int(selected_shovel.name().split('_')[1])
+                    location_clusters = cfg_samp.get_sampled_value('shovel_location_cluster')
+                    location_cluster = location_clusters[shovel_id]
+                    norm_time_rev = cfg_samp.get_sampled_value(f'SZ{location_cluster}D')  # Zone to Dump (return)
+                except (KeyError, IndexError) as e:
+                    print(f"ERROR: Could not get return travel time from dump: {e}")
                 vmax_rnd_rev = 330/ (norm_time_rev)
                 traj_04 = sim.TrajectoryCircle(radius=180, x_center=300, y_center=470, angle0=150, angle1=360, v0 = 0, vmax  = vmax_rnd_rev)
                 self.dump_truck_2 = sim.AnimateImage("dump_truck_02.png", width=70, x=traj_04.x, y=traj_04.y,angle=traj_04.angle,text=str(num), text_anchor = "c", fontsize= 20, textcolor = "red")
@@ -1005,13 +1248,13 @@ def print_trip_counts(ppflag=1):
 class PrintTripCountsEvent(sim.Component):
     def process(self):
         while True:
-            yield self.hold(1)  # Wait for 100 units of time
+            yield self.hold(5)  # Wait for 100 units of time
             print_trip_counts()
 
 class TrackIdleTime(sim.Component):
     def process(self):
         while True:
-            yield self.hold(1)  # Check every time unit
+            yield self.hold(5)  # Check every time unit
             current_time = env.now()
             for shovel in shovels:
                 if not shovel.claimers():
@@ -1035,7 +1278,7 @@ class PrintShovelIdleTimes(sim.Component):
 class PrintClaimersStatusEvent(sim.Component):
     def process(self):
         while True:
-            yield self.hold(2)  # Wait for 100 units of time
+            yield self.hold(10)  # Wait for 100 units of time
             print_resource_status()
 
 def print_resource_status(pflag=1):
@@ -1110,14 +1353,20 @@ def print_resource_status(pflag=1):
 
 
 class KPICalculator(sim.Component):
-    def setup(self):
+    #def setup(self):
+    def setup(self, scenario_name=None, seed=None):
         self.HIGH_FREQ = 2
         self.SHIFT_DURATION = shift_dura
         self.HOUR = 60  # Assuming time units are in minutes
         self.last_high_freq_update = 0
         self.last_shift_update = 0
         self.last_hour_update = 0
-        self.csv_filename = f'kpi_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+        
+        # Build filename with scenario and seed
+        scenario_part = f"scenario_{scenario_name}_" if scenario_name else ""
+        seed_part = f"seed_{seed}_" if seed is not None else ""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.csv_filename = f'kpi_log_{scenario_part}{seed_part}{timestamp}.csv'
         self.file_exists = os.path.exists(self.csv_filename)
         self.shift_counter = 0
         
@@ -1392,18 +1641,103 @@ class KPICalculator(sim.Component):
                 print(f"Error in KPI Calculator process: {e}")
                 raise  # Re-raise the exception for debugging
 
-#
-#
-#
-#
 
-def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None):
 
-    global env, shovels, truck, dumps, crushers, shovel_idle_times, shovel_last_check, shovel_animations, RL_sched, def_schdlr_choice
 
-    global all_trk_shv_dec  # Make sure to include this global
-    # Clear the deque at the beginning of each episode
-    all_trk_shv_dec.clear()
+
+def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None, episode_seed=None, scenario_overrides=None, csv_path=None, scenario_name=None, play_seed=None):
+
+    global file_path
+    global env, shovels, truck, dumps, crushers
+    global shovel_idle_times, shovel_last_check, shovel_animations
+    global RL_sched, def_schdlr_choice, all_trk_shv_dec, epsilon
+    global cfg_samp
+    global Num_trucks, Num_shovels, Num_crushers, Num_dumps
+    global shift_dura, targ_pvol, load_per_trip, choice
+    global total_trips, total_crush_trips
+    global truck_trip_counts, truck_phases, truck_last_trip_times
+    global shovel_wait_time_tracker
+    global trip_times, shovel_queues
+    global r_imm_d_pt, terminated, pvol, sim_exit
+
+    if csv_path is None:
+        raise ValueError("csv_path must be explicitly provided to runDes")
+
+    file_path = csv_path
+
+    # ========================================================================
+    # STEP 1: Reset Truck class variables FIRST
+    # ========================================================================
+    Truck.trucks_to_fail = None
+    Truck.trucks_failed = 0
+
+    previous_episode_count = getattr(cfg_samp, 'episode_count', 0)
+    # ========================================================================
+    # STEP 2: ALWAYS reinitialize ConfigSampler (not just for overrides)
+    # ========================================================================
+    cfg_samp = ConfigSampler('config_extend_review.txt', 
+                             scenario_overrides=scenario_overrides)
+
+     # =====  DEBUG CODE =====
+    if scenario_overrides:
+        print(f"\n=== Scenario Overrides Active ===")
+        print(f"Overrides: {scenario_overrides}")
+    # ===== END DEBUG CODE =====
+
+    # ========================================================================
+    # STEP 3: Initialize fresh episodic parameters for this episode
+    # ========================================================================
+    cfg_samp.new_episode(episode_seed)
+    # Store scenario and seed for KPI filename
+    global current_scenario, current_seed
+    current_scenario = scenario_name if scenario_name else "default"
+    current_seed = play_seed if play_seed is not None else (episode_seed if episode_seed is not None else 0)
+
+    # ========================================================================
+    # STEP 4: Sample ALL parameters BEFORE using them
+    # ========================================================================
+    Num_trucks = int(cfg_samp.get_sampled_value('TR'))
+    Num_shovels = int(cfg_samp.get_sampled_value('SH'))
+    Num_crushers = int(cfg_samp.get_sampled_value('CR')) 
+    Num_dumps = int(cfg_samp.get_sampled_value('DS'))
+    shift_dura = cfg_samp.get_sampled_value('Sdur')
+    targ_pvol = cfg_samp.get_sampled_value('PVol_targ')
+    load_per_trip = cfg_samp.get_sampled_value('LO')
+    choice = int(cfg_samp.get_sampled_value('scheduler_choice'))
+    epsilon = cfg_samp.get_sampled_value('Eps')
+
+    # ========================================================================
+    # STEP 5: Reset all counters and state dictionaries
+    # ========================================================================
+    total_trips = 0
+    total_crush_trips = 0
+    truck_trip_counts = {}
+    truck_phases = {}
+    truck_last_trip_times = {}
+    sim_exit = False           
+    r_imm_d_pt = None          
+    terminated = False         
+    pvol = 0 
+
+    # ========================================================================
+    # STEP 6: NOW create deques and trackers with correct sizes
+    # ========================================================================
+    all_trk_shv_dec = deque(maxlen=Num_trucks * 2)
+    shovel_wait_time_tracker = ShovelWaitTimeTracker(Num_shovels)
+    
+    # Reset rolling reward windows
+    trip_times.clear()
+    shovel_queues.clear()
+
+    # ========================================================================
+    # STEP 7: Print episode summary and continue with rest of function
+    # ========================================================================
+    print_episode_summary()
+
+    if flag_RL_sched:
+        print("\n" + "="*70)
+        print(f"    STARTING EPISODE {cfg_samp.episode_count}")
+        print("="*70 + "\n")
 
     shovel_animations = {}
     env = sim.Environment(trace=False, time_unit='minutes') #set simulation to work in minutes
@@ -1429,7 +1763,7 @@ def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None):
     breakdown_manager.activate()
 
     # Create the KPI calculator component
-    kpi_calculator = KPICalculator()
+    #kpi_calculator = KPICalculator(scenario_name=current_scenario, seed=current_seed)
 
 
     # Animation display setup------------------------------------------------------------------
@@ -1438,6 +1772,8 @@ def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None):
     env.AnimateText(text=time_display, x=800, y=50, fontsize=20, textcolor = "white") #Display time
     env.background_color(("#eeffcc"))
 
+    #Display config parameters 
+    #sim.AnimateText(text=config_display(config), x=10, y=80, text_anchor='w', fontsize=12, textcolor='white' )
 
     # Dictionary to track idle times for each shovel
     shovel_idle_times = {shovel.name(): 0 for shovel in shovels}
@@ -1510,6 +1846,7 @@ def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None):
     sim.AnimateText(text="Crushing", x=xc_init-300, y=yc_init - 60, fontsize=15, textcolor="white")
     sim.AnimateText(text="Waiting", x=xc_init-300, y=yc_init - 120, fontsize=15, textcolor="white")
 
+
     print('-------**----')
     print(f"\nStarting simulation. Duration set to: {shift_dura} time units")
     env.run(till=shift_dura)
@@ -1522,27 +1859,62 @@ def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None):
     pvol = total_crush_trips * load_per_trip #Calculate total production volume for the shift 
     wvol = max(total_trips - total_crush_trips, 0) * load_per_trip
   
+    # Calculate final diversity score (e.g., as the diversity of the entire deque history)
+    final_diversity_score = diversity_score()
 
     if RL_sched  == True:
-        # Calculate production ratio (scaled between 0-1)
-        prod_ratio = min(1.0, pvol/targ_pvol)
+        prod_ratio = min(1.0, pvol/targ_pvol)  # Calculate production ratio (scaled between 0-1)
+        bonus = 0.0
 
-        # Calculate diversity penalty (normalized between 0-1)
-        div_penal = calculate_shovel_imbalance(shovels)
-        max_possible_imbalance = Num_trucks  # Theoretical maximum
-        norm_diversity_penalty = min(1.0, div_penal / max_possible_imbalance)
+        final_diversity = diversity_score()
+
+
+        if prod_ratio >= 0.95 and final_diversity > 0.65:
+            bonus = 0.5
+        elif prod_ratio >= 0.90 and final_diversity > 0.50:
+            bonus = 0.2
+        else:
+            bonus = 0.0
 
         # Balance the components with appropriate weights
-        r_epi = 0.7 * prod_ratio - 0.3 * norm_diversity_penalty
+        r_epi = 0.4 * prod_ratio - 0.6*( 1- final_diversity) + bonus 
 
         print('\n **** ')
         print("pvol: {}, r_epi: {}, total_trips: {}, load_per_trip: {}, r_imm_d_pt: {}, targ_pvol: {}".format(pvol, r_epi, total_trips, load_per_trip, r_imm_d_pt, targ_pvol))
-        observ = create_observation(Num_shovels, Num_trucks, print_resource_status(pflag=0)['Shovels'], print_trip_counts(ppflag=0))
-        info = {'PVOL': pvol} #KPI at end of shift
+
+        # Get all truck data
+        all_truck_data = print_trip_counts(ppflag=0)
+    
+        # Filter to just one truck (pick any - doesn't matter which)
+        if all_truck_data:
+            # Use the first available truck
+            first_truck_key = list(all_truck_data.keys())[0]
+            terminal_truck_data = {first_truck_key: all_truck_data[first_truck_key]}
+        else:
+            # Fallback (shouldn't happen - there should always be trucks)
+            terminal_truck_data = {'Truck.1': {'trip_count': 0, 'phase': '000'}}
+
+        all_trips = list(truck_trip_counts.values())
+        fleet_summary = {
+            'avg_trips': sum(all_trips) / len(all_trips) if all_trips else 0,
+            'recent_decisions': all_trk_shv_dec,
+            'diversity_score': final_diversity_score
+        }
+    
+        # Now pass only 1 truck (same structure as during episode)
+        observ = create_observation(Num_shovels, Num_trucks,
+                                   print_resource_status(pflag=0)['Shovels'],
+                                   terminal_truck_data, fleet_summary)  # ← Now passes 1 truck
+    
+        info = {'PVOL': pvol, 'DivScore': final_diversity_score}
         final_step_update(observ, r_epi, info)
         print("Current observ: "+str(observ))
+        #return pvol
+        # Increment episode count for tracking
+        cfg_samp.episode_count += 1
         sys.exit()
     elif RL_sched  == False:
         return pvol
 
 
+   

@@ -1,0 +1,71 @@
+#=====--Fixed parameter, sampled once and then reloaded repeatedly--=======
+
+# Equipment counts - define environment structure
+Num_trucks(TR): 60
+Num_shovels(SH): 8
+Num_crushers(CR): 5
+Num_dumps(DS): 3
+scheduler_choice: 3
+Shift_duration(Sdur): 360
+load_per_trip(LO): 100
+
+# Equipment characteristics - inherent mine infrastructure properties
+shovel_performance_class: [1, 2, 1, 3, 2, 3, 1, 2]
+shovel_location_cluster: [1, 1, 2, 2, 3, 3, 1, 2]
+
+# Infrastructure-based parameters - these don't change during operations
+SZ1C: Normal(8, 2)      # Zone 1 to Crushers - fixed mine layout
+SZ1D: Normal(18, 3)     # Zone 1 to Dumps
+SZ2C: Normal(15, 3)     # Zone 2 to Crushers  
+SZ2D: Normal(12, 2)     # Zone 2 to Dumps
+SZ3C: Normal(22, 4)     # Zone 3 to Crushers
+SZ3D: Normal(8, 1)      # Zone 3 to Dumps
+
+# Equipment-specific operational parameters - inherent to equipment types
+truck_dumping_dmp(TRDM): Normal(5, 2)
+truck_dumping_crush(TRCR): Normal(15, 1)
+
+# Base reliability parameters - equipment design characteristics
+Shovel(RSH): Poisson(60)    # MTTR - repair procedures are standardized
+Truck(RTR): Poisson(45) 
+Crusher(RCR): Poisson(90) 
+Dumping_site(RDS): Poisson(30)
+
+# Target production - often set for longer periods (weekly/monthly)
+target_pvol(PVol_targ): 20000
+
+
+
+#=====--Sample per Shift or Episode (where Shift = Episode)--===============
+# Daily operational variability - what actually changes shift-to-shift
+
+epsilon(Eps): Normal(0.35, 0.07)  # Ore grade/stripping ratio varies daily
+
+# Cost parameters - fluctuate with market conditions and daily operations
+known_cost: Uniform Min: 35000, Max: 45000
+estimated_cost: Uniform Min: 12000, Max: 18000
+
+# Equipment performance variations - daily wear, weather, operator skill
+TRL_C1: Normal(6, 1)    # Loading times vary by operator/conditions
+TRL_C2: Normal(9, 2)    
+TRL_C3: Normal(12, 2)  
+
+# Daily operational conditions affecting performance
+truck_waste(FW): Normal(0.35, 0.05)  # Fuel consumption varies with conditions
+truck_ore(FO): Normal(0.28, 0.05)
+truck_empty(FE): Normal(0.20, 0.06)
+
+truck_empty(TE): Normal(55, 12)      # Speed varies with weather/road conditions  
+truck_loaded(TL): Normal(30, 8)
+
+# Equipment health status - changes daily based on usage/maintenance
+Shovel(FSH): Poisson(75)     # MTBF - varies with operational intensity
+Truck(FTR): Poisson(90)
+Crusher(FCR): Poisson(120)
+Dumping_site(FDS): Poisson(180)
+
+# Experimental/scenario parameters - for creating diverse training situations
+shovels_to_fail(STF): Uniform Min: 1, Max: 5
+trucks_to_fail(TTF): Uniform Min: 10, Max: 30
+shovel_initial_breakdown(SIB): Uniform Min: 10, Max: 45
+truck_initial_breakdown(TIB): Uniform Min: 10, Max: 90

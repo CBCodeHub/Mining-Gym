@@ -1,0 +1,50 @@
+# Test Scenario Configuration File
+# Format: scenario_id: param1=value1, param2=value2, ...
+
+[SCENARIO_A]
+# No failures - Baseline
+epsilon: 0.35
+shovels_to_fail: 0
+trucks_to_fail: 0
+shovel_initial_breakdown: 999999
+truck_initial_breakdown: 999999
+
+[SCENARIO_B]
+# Moderate Truck Stress - 25% fleet down
+epsilon: 0.35
+shovels_to_fail: 0
+trucks_to_fail: 15
+shovel_initial_breakdown: 999999
+truck_initial_breakdown: 180
+
+[SCENARIO_C]
+# Single Shovel Loss - 12.5% loading capacity
+epsilon: 0.35
+shovels_to_fail: 1
+trucks_to_fail: 0
+shovel_initial_breakdown: 150
+truck_initial_breakdown: 999999
+
+[SCENARIO_D]
+# Combined Stress - Shovel + Truck failures
+epsilon: 0.35
+shovels_to_fail: 1
+trucks_to_fail: 15
+shovel_initial_breakdown: 150
+truck_initial_breakdown: 200
+
+[SCENARIO_E]
+# Severe Disruption - 25% shovels + 50% trucks
+epsilon: 0.35
+shovels_to_fail: 2
+trucks_to_fail: 30
+shovel_initial_breakdown: 120
+truck_initial_breakdown: 150
+
+[SCENARIO_F]
+# Critical Bottleneck - 37.5% loading capacity lost
+epsilon: 0.35
+shovels_to_fail: 3
+trucks_to_fail: 0
+shovel_initial_breakdown: 100
+truck_initial_breakdown: 999999
