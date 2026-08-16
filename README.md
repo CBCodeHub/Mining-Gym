@@ -82,7 +82,3 @@ Both write a `*_perf_summ.csv` (mean/std per scenario) and a `*_perf_episodes.cs
 ## 5. Change configuration data
 
 Edit `config_extend_review.txt` for general simulation settings (fleet size, distributions, and other simulation parameters), or `T_scene_config.txt` for the fixed `A`–`F` scenario overrides used by `--scenario`.
-
----
-
-For the full list of flags — seeding options, training controls, and batch-sweep settings — see `cli_reference.md`.
