@@ -1,93 +1,199 @@
+"""
+Driver for classical (non-RL) scheduling policies.
+
+Seeding (matches mGym_GymRun.py):
+    --seed N        Same integer N for every episode (deterministic replay).
+    --seed_start N  LCG anchor; episode i uses gen_seed(i, N). Use for
+                    baseline evaluation (mean +- std over episodes).
+    (default)       --seed_start 0
+
+Outputs are routed through results_paths.py:
+
+    results/non-RL_baselines/
+        kpi_log_{algo}_scen{X}_seed{Y}.csv          -- per-tick KPI log
+        SchdSchm{choice}_{algo}_scen{X}_seed{Y}_Pvol.csv
+                                                    -- per-episode summary
+        channel_{algo}_scen{X}_seed{Y}.csv          -- placeholder path passed to runDes
+
+Y in the filename is whichever integer was passed (--seed OR --seed_start);
+the CSV's Episode_Seed column is the ground truth for per-episode seeds.
+"""
+
 import argparse
-import mGym_DesEnv as denv
-import numpy as np
+import ast
 import csv
 import json
 import os
 import random
-import sys
+from collections import defaultdict
+
+import numpy as np
+
+import mGym_DesEnv as denv
 from scenario_loader import load_scenario
+from results_paths import (
+    classical_algo_tag,
+    kpi_log_path,
+    channel_csv_path,
+    results_dir,
+    experiment_tag,
+)
+from seed_utils import resolve_episode_seeds
 
 
 def save_temp_data(cfg_seed_info, data):
     with open(cfg_seed_info, 'w') as file:
         json.dump(data, file)
 
-def gen_seed(iteration, initial_seed=None, ax=1664525, cx=1013904223, mx=2**32):
+
+def _compute_mean_queue_per_episode(kpi_path):
     """
-    Generate a seed based on the iteration using a Linear Congruential Generator (LCG).
-    
-    - iteration: The current iteration (episode).
-    - initial_seed: The starting seed. If None, use a truly random seed.
-    - ax, cx, mx: Constants for the Linear Congruential Generator.
-    
-    Returns the seed for the given iteration.
+    Compute mean total shovel queue length per episode from the
+    multi-episode KPI log ("total" = sum across shovels at a tick,
+    "mean" = average of that sum across the episode's ticks).
+
+    Returns {episode_idx: mean_queue}; interrupted/missing episodes are
+    simply absent. Uses ast.literal_eval (not eval) on the list-string
+    column so a malformed cell fails loudly instead of executing code.
     """
-    # Use a truly random initial seed if one is not provided
-    if initial_seed is None:
-        initial_seed = random.randint(0, mx - 1)
-    
-    epi_seed = initial_seed
-    for tx in range(iteration):
-        epi_seed = (ax * epi_seed + cx) % mx
-    return epi_seed
+    if not (kpi_path.exists() and kpi_path.stat().st_size > 0):
+        return {}
+
+    sums = defaultdict(float)
+    counts = defaultdict(int)
+
+    with open(kpi_path, newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            queue_str = row.get('Shovel_Queue_Lengths', '')
+            if not (isinstance(queue_str, str) and queue_str.strip().startswith('[')):
+                continue
+            try:
+                total = sum(ast.literal_eval(queue_str))
+            except (ValueError, SyntaxError):
+                continue
+            try:
+                ep = int(row['Episode'])
+            except (KeyError, ValueError, TypeError):
+                continue
+            sums[ep] += total
+            counts[ep] += 1
+
+    return {ep: sums[ep] / counts[ep] for ep in sums if counts[ep] > 0}
 
 
+def _build_parser():
+    # allow_abbrev=False: a typo like `--sed 0` fails loudly instead of
+    # silently binding to whatever unique prefix it happens to match.
+    parser = argparse.ArgumentParser(
+        description="Run the simulation with a classical scheduling policy.",
+        allow_abbrev=False,
+    )
+    parser.add_argument('--num_episodes', type=int, default=10,
+                        help="Number of episodes to run")
+    parser.add_argument('--algo_choice', type=int, required=True,
+                        help="Scheduler choice (1=rnd, 2=fixed, 3=sqf, 4=mswt). "
+                             "See mGym_DesEnv.scheduler_assign() for the "
+                             "dispatch table (ground truth).")
+    parser.add_argument('--scenario', type=str, default=None,
+                        help="Test scenario (A, B, C, D, E, F)")
 
-# Set up argparse to parse command-line arguments
-parser = argparse.ArgumentParser(description="Run the simulation with specified number of iterations and algorithm choice.")
-parser.add_argument('--num_episodes', type=int, default=10, help="Number of episodes to run the simulation")
-parser.add_argument('--algo_choice', type=int, required=True, help="Choice of scheduling algorithm (integer only)")
-parser.add_argument('--scenario', type=str, default=None, help="Test scenario (A, B, C, D, E, F)")  
-parser.add_argument('--seed', type=int, default=None, help="Initial integer seed for the simulation episodes (optional)")
+    seed_group = parser.add_mutually_exclusive_group()
+    seed_group.add_argument(
+        '--seed', type=int, default=None,
+        help="Fixed seed for every episode (deterministic replay). "
+             "Mutually exclusive with --seed_start."
+    )
+    seed_group.add_argument(
+        '--seed_start', type=int, default=None,
+        help="LCG anchor: episode i uses gen_seed(i, seed_start). "
+             "Mutually exclusive with --seed."
+    )
+    return parser
 
 
-args = parser.parse_args()
+def main():
+    parser = _build_parser()
+    args = parser.parse_args()
 
-# Get the number of iterations and algorithm choice from command line arguments
-iter = args.num_episodes
-algo_choice = args.algo_choice
-scenario_overrides = load_scenario(args.scenario) 
-initial_seed = args.seed # NEW: Get the initial seed
-DUMMY_CSV_PATH = 'default_run_dummy.csv'
+    # Default: LCG anchored at 0 (matches mGym_GymRun.py train's default).
+    if args.seed is None and args.seed_start is None:
+        args.seed_start = 0
 
-# Array to store KPI values for each iteration
-arr = []
+    num_episodes = args.num_episodes
+    algo_choice = args.algo_choice
+    scenario_overrides = load_scenario(args.scenario)
 
-# Run the simulation for the specified number of iterations
-for epsd in range(iter):
-    if os.path.exists('alloc.json'):
-        os.remove('alloc.json')
-    print("Cleaned up stale alloc.json from previous run")
-    
-    # --- NEW: Generate a unique seed for the current episode ---
-    episode_seed = gen_seed(epsd, initial_seed=initial_seed)
-    random.seed(episode_seed)      
-    np.random.seed(episode_seed)
-    
-    # Run the simulation with the specified parameters
-    kpi_01 = denv.runDes(fsim=False, 
-                         flag_RL_sched=False, 
-                         fdef_schdlr_choice=algo_choice,
-                         episode_seed=episode_seed, 
-                         scenario_overrides=scenario_overrides,
-                         csv_path=DUMMY_CSV_PATH ) 
-    print(f"Episode {epsd+1} Seed: {episode_seed}, Value of KPI01-PVol: {kpi_01}")
-    # Append the result to the list
-    arr.append(kpi_01)
+    episode_seeds, anchor, mode = resolve_episode_seeds(
+        seed=args.seed,
+        seed_start=args.seed_start,
+        num_episodes=num_episodes,
+    )
 
-# Calculate the average KPI value
-mean_kpi01 = np.mean(arr)
-print(f"Average KPI01-PVol: {mean_kpi01}, over {iter} repeats")
+    algo = classical_algo_tag(algo_choice)
+    kpi_path = kpi_log_path("classical", algo, args.scenario, anchor)
+    channel_path = channel_csv_path("classical", algo, args.scenario, anchor)
 
-# Save the array as a CSV file
-scenario_suffix = f"_scenario_{args.scenario}" if args.scenario else ""
-seed_suffix = f"_seed_{initial_seed}" if initial_seed is not None else ""
-fil_name = f"SchdSchm{algo_choice}{scenario_suffix}{seed_suffix}_Pvol.csv"
+    # Fresh KPI log per invocation -- otherwise rows from a prior run
+    # under the same (algo, scenario, anchor) would concatenate.
+    if kpi_path.exists():
+        kpi_path.unlink()
 
-# Write the data to CSV
-with open(fil_name, mode='w', newline='') as file:
-    writer = csv.writer(file)
-    writer.writerow(["Episodes", "KPI0_PVol"])  # Writing the header
-    for idx, value in enumerate(arr, 1):
-        writer.writerow([idx, value])
+    print(f"--- Classical scheduler run ---")
+    print(f"    algo tag:    {algo}  (choice={algo_choice})")
+    print(f"    scenario:    {args.scenario}")
+    print(f"    seed mode:   {mode}  (anchor={anchor})")
+    print(f"    episodes:    {num_episodes}")
+    print(f"    KPI log:     {kpi_path}")
+
+    pvols = []
+    for epsd, episode_seed in enumerate(episode_seeds):
+        # Static round-robin LUT is state-on-disk from a previous run;
+        # clear it so shovel/truck count changes don't feed a stale
+        # allocation table into the fixed() policy.
+        if os.path.exists('alloc.json'):
+            os.remove('alloc.json')
+
+        random.seed(episode_seed)
+        np.random.seed(episode_seed)
+
+        kpi_01 = denv.runDes(
+            fsim=False,
+            flag_RL_sched=False,
+            fdef_schdlr_choice=algo_choice,
+            episode_seed=episode_seed,
+            scenario_overrides=scenario_overrides,
+            csv_path=str(channel_path),
+            scenario_name=args.scenario,
+            play_seed=anchor,
+            episode_idx=epsd,
+            kpi_log_path=str(kpi_path),
+        )
+        print(f"Episode {epsd+1} Seed: {episode_seed}, "
+              f"Value of KPI01-PVol: {kpi_01}")
+        pvols.append(kpi_01)
+
+    mean_kpi01 = float(np.mean(pvols)) if pvols else 0.0
+    print(f"Average KPI01-PVol: {mean_kpi01}, over {num_episodes} repeats")
+
+    # Legacy per-episode summary CSV. Episode_Seed is the seed actually
+    # used (see header); Mean_Queue_Length comes from the KPI log.
+    mean_queues = _compute_mean_queue_per_episode(kpi_path)
+
+    tag = experiment_tag(algo, args.scenario, anchor)
+    legacy_pvol_path = (
+        results_dir("classical") / f"SchdSchm{algo_choice}_{tag}_Pvol.csv"
+    )
+    with open(legacy_pvol_path, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["Episodes", "Episode_Seed", "KPI0_PVol", "Mean_Queue_Length"]
+        )
+        for idx, (pvol, ep_seed) in enumerate(zip(pvols, episode_seeds), 1):
+            mean_q = mean_queues.get(idx - 1, "")  # KPI log uses 0-based Episode
+            writer.writerow([idx, ep_seed, pvol, mean_q])
+    print(f"Legacy PVOL CSV: {legacy_pvol_path}")
+
+
+if __name__ == "__main__":
+    main()

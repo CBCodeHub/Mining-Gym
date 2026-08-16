@@ -4,13 +4,8 @@ Minimal scenario loader for test configurations
 
 def load_scenario(scenario_name):
     """
-    Load test scenario parameters from T_scene_config.txt
-    
-    Args:
-        scenario_name: Name like 'A', 'B', 'C', etc. or None for normal mode
-        
-    Returns:
-        dict: Parameter overrides or empty dict if no scenario
+    Load parameter overrides for `scenario_name` from T_scene_config.txt.
+    Returns {} if scenario_name is None or the section isn't found.
     """
     if scenario_name is None:
         return {}
@@ -22,33 +17,28 @@ def load_scenario(scenario_name):
         with open('T_scene_config.txt', 'r') as f:
             lines = f.readlines()
         
-        # Find the scenario section
         in_section = False
         overrides = {}
         
         for line in lines:
             line = line.strip()
             
-            # Skip empty lines and comments
             if not line or line.startswith('#'):
                 continue
             
-            # Check if entering the target section
             if line == section_name:
                 in_section = True
                 continue
             
-            # Check if entering a different section
             if line.startswith('[') and in_section:
                 break
             
-            # Parse parameters in the target section
             if in_section and ':' in line:
                 key, value = line.split(':', 1)
                 key = key.strip()
                 value = value.strip()
                 
-                # Map to internal parameter names
+                # Map human-readable keys to internal parameter names
                 param_map = {
                     'epsilon': 'Eps',
                     'shovels_to_fail': 'STF',

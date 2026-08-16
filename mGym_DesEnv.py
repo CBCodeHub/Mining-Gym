@@ -1,8 +1,7 @@
-﻿'''
-Representing the Mining Load and Haul Cycle using Discrete Event Simulation in  Salabim (BOTTOM of 3)
-'''
+"""
+Mining Load and Haul Cycle discrete-event simulation, built on Salabim
+"""
 
-from pickle import FALSE
 import salabim as sim
 sim.yieldless(False)
 import gymnasium as gym
@@ -20,29 +19,114 @@ import threading
 import tempfile
 import shutil
 import queue
+import functools
 from collections import deque, Counter
 import numpy as np
-import time
 import sys
 import os
-import random
 from datetime import datetime
 
-# Global lock for CSV operations
+# In-process channel to the Gym/RL side (this module runs on a worker
+# thread). ChannelStopped lets a blocked decision point unwind cleanly
+# when the Gym requests an episode reset/shutdown.
+from shared_channel import ChannelStopped
+
+# Append-only per-episode metrics log (separate from kpi_calc.py's
+# single-snapshot JSON), so training progress can be tracked live.
+from episode_metrics_logger import log_episode_metrics, log_dispatch_decision
+
+
+_RUN_DES_LOCK = threading.Lock()
+_thread_locals = threading.local()
+_DES_VERBOSE = int(os.environ.get('DES_VERBOSE', '0'))
+
+# Every module global the truck process (or anything it calls during an
+# episode) reads. The snapshot/restore helpers below preserve the
+# calling thread's view of these across a wait_for_action gap.
+_DES_GLOBAL_NAMES = (
+    'env', 'shovels', 'truck', 'dumps', 'crushers', 'shovel_animations',
+    'shovel_idle_times', 'shovel_last_check',
+    '_channel', 'cfg_samp',
+    'RL_sched', 'def_schdlr_choice', 'all_trk_shv_dec', 'epsilon',
+    'rl_decision_index',
+    'Num_trucks', 'Num_shovels', 'Num_crushers', 'Num_dumps',
+    'shift_dura', 'targ_pvol', 'load_per_trip', 'choice',
+    'total_trips', 'total_crush_trips',
+    'broken_shovel_dispatch_count',
+    'episode_shovel_choices', 'episode_queue_sum', 'episode_queue_count',
+    'truck_trip_counts', 'truck_phases', 'truck_last_trip_times',
+    'shovel_wait_time_tracker',
+    'trip_times', 'shovel_queues',
+    'r_imm_d_pt', 'terminated', 'pvol', 'sim_exit',
+    'file_path',
+)
+
+
+def _snapshot_des_globals():
+    """Return a dict of the current values of the per-episode module globals."""
+    g = globals()
+    return {name: g.get(name) for name in _DES_GLOBAL_NAMES}
+
+
+def _restore_des_globals(snap):
+    """Restore module globals from a snapshot dict produced by _snapshot_des_globals."""
+    g = globals()
+    for name, value in snap.items():
+        g[name] = value
+
+
+def _with_runDes_lock(fn):
+    """
+    Decorator that acquires _RUN_DES_LOCK for the lifetime of a runDes() call.
+    Combined with the release-around-wait_for_action pattern in Truck.process(),
+    this lets multiple DES threads coexist in the same Python process without
+    racing on the module globals.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        _RUN_DES_LOCK.acquire()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            # Balances the acquire above; wait_for_action's own release/
+            # reacquire around the blocking wait leaves this safe even if
+            # it raised mid-wait (its finally clause reacquires first).
+            _RUN_DES_LOCK.release()
+    return wrapper
+
+
+def _vprint(level, *args, **kwargs):
+    """
+    Print only when DES_VERBOSE is at or above the given level. Used to gate
+    the per-decision / per-20-step debug prints that otherwise flood the
+    terminal during long runs.
+    """
+    if _DES_VERBOSE >= level:
+        print(*args, **kwargs)
+
+
+def _dispatch_log_path():
+    """
+    Build the per-decision dispatch-diagnostics CSV path from the same
+    file_path/csv_path used for the episode-metrics log, so train/test/eval
+    runs each get their own file. Falls back to a fixed name if file_path
+    isn't set yet, since this is diagnostic logging only.
+    """
+    fp = globals().get('file_path', None)
+    return (os.path.splitext(str(fp))[0] + "_dispatch_log.csv") if fp else "dispatch_log.csv"
+
 csv_lock = threading.Lock()
 
-'''
-Previous version DES_comm_03
-'''
-
-update_freq = 20 #10 units of time
+update_freq = 20  # time units between rate-keeping prints
 shift_start_time = 0
 all_trk_shv_dec = None 
+# Monotonic RL-decision counter for the current episode, reset in runDes.
+# all_trk_shv_dec (a maxlen deque for the diversity score) saturates at
+# its cap, so it isn't usable as a decision index.
+rl_decision_index = 0
 
-cfg_samp = ConfigSampler('config_extend_review.txt') #, cnfg_seed = cnfg_seed) #load from configuration file
+cfg_samp = ConfigSampler('config_extend_review.txt')
 cfg_samp.episode_count = 0
-#cfg_samp = ConfigSampler('config_extend.txt', time_scale=5.0)
-#time_scale = 5
 
 # Fixed parameters loaded from config (cached, same across episodes)
 Num_trucks = None 
@@ -54,21 +138,22 @@ targ_pvol = None
 load_per_trip = None
 choice = None 
 
-# Episodic parameters (will be updated in runDes for each episode)
-epsilon = 0.35  # Default value, updated in runDes()
+epsilon = 0.35  # episodic parameter; updated in runDes() per episode
 
-
-#file_path = 'envDes_shrd.csv'
-RL_sched = True # initializing the flag
+RL_sched = True
 def_schdlr_choice = None
 
+# In-process channel to the Gym/RL side, set once per episode at the top
+# of runDes(). None for classical/rule-based runs (mGym_DefSchdRun.py),
+# in which case every channel hook below is a no-op.
+_channel = None
 
-r_optimal = (1-epsilon)/epsilon #used for calculating waste trip balance
+r_optimal = (1-epsilon)/epsilon  # used for calculating waste trip balance
 
 xs_init = 450  # x init value of shovel queue
 xd_init = 100  # x init value of dump queue
 
-# Define Truck state code using bytes
+# Truck state codes as bytes
 phase_shovel = '000'
 phase_crusher = '001'
 phase_dump = '010'
@@ -87,26 +172,30 @@ terminated = False
 pvol = 0
 
 
-# Global variables
-total_trips = 0  # Initialize total_trips to 0
+total_trips = 0
 avg_idle_orig_time = 0
 sim_exit = False
-total_crush_trips = 0  # Initialize total dump trips counter
+total_crush_trips = 0
+broken_shovel_dispatch_count = 0  # sanity counter; should stay 0 once action masking is active
 
+# Per-episode histogram of RL shovel choices {shovel_idx: count}: the
+# standing shovel-hugging monitor, reset each episode and summarized
+# (max share / selection entropy / unused-shovel count) at shift end.
+episode_shovel_choices = {}
 
+# Per-episode running sum/count of queue length at the chosen shovel per
+# RL decision, feeding mean_queue into the terminal info dict so an
+# external eval callback can read operational queue quality directly.
+episode_queue_sum = 0.0
+episode_queue_count = 0
 
-# Add this global variable to keep track of trips
 truck_trip_counts = {}
-truck_phases = {}  # Dictionary to track truck phases
+truck_phases = {}
 
 
-
-# Deque manipulation code
 def add_item(item):
-    # Make the deque global to allow modifications
     global all_trk_shv_dec
     all_trk_shv_dec.append(item)
-    #print(f"Updated deque: {all_trk_shv_dec}")
 
 def diversity_score() -> float:
     """
@@ -115,7 +204,6 @@ def diversity_score() -> float:
     """
     global all_trk_shv_dec, Num_shovels, Num_trucks
     
-    #window_size = min(Num_trucks * 2, len(all_trk_shv_dec))
     window_size = min(30, len(all_trk_shv_dec)) 
     trk_shv_dec = deque(list(all_trk_shv_dec)[-window_size:])
     
@@ -139,29 +227,20 @@ def diversity_score() -> float:
 
 def calculate_shovel_imbalance(shovels):
     global all_trk_shv_dec
-    # Count the frequency of each shovel choice
     shovel_counts = Counter(all_trk_shv_dec)
-    
-    # Ensure all shovels are counted (even those not in deque)
+
     for shovel in shovels:
         if shovel not in shovel_counts:
             shovel_counts[shovel] = 0
-    
-    # Calculate the total number of shovels chosen
+
     total_shovels = len(all_trk_shv_dec)
-    
-    # Calculate the imbalance (difference between max and min shovel counts)
     if total_shovels == 0:
-        return 0.0  # No actions in the deque
-    
-    # Get the max and min shovel counts
+        return 0.0
+
     max_count = max(shovel_counts.values())
     min_count = min(shovel_counts.values())
-    
-    # The imbalance score is the difference between the max and min counts
     imbalance = max_count - min_count
-    
-    # ADD THESE 2 LINES:
+
     zero_usage_count = sum(1 for count in shovel_counts.values() if count == 0)
     starvation_penalty = zero_usage_count * (total_shovels / Num_shovels)
     
@@ -177,11 +256,8 @@ def calculate_streak_penalty() -> float:
     
     if len(all_trk_shv_dec) < 15:
         return 0.0
-    
-    # Look at last 15 decisions
+
     recent = list(all_trk_shv_dec)[-15:]
-    
-    # Count how many consecutive same choices
     same_count = sum(1 for i in range(1, len(recent)) if recent[i] == recent[i-1])
     streak_ratio = same_count / (len(recent) - 1)
     
@@ -189,23 +265,35 @@ def calculate_streak_penalty() -> float:
 
 def scheduler_assign(choice, truck_id=None):
     '''
-    Reads user choice of scheduler and queries it
+    Reads user choice of scheduler and queries it.
+ 
+    Algorithm registry:
+        1. Random
+        2. Fixed (round-robin LUT)
+        3. Shortest queue 
+        4. Shortest Queue First
+        5. Minimum Shovel Waiting Time 
     '''
-    def_scheduler = sch.DefaultScheduler() #instance of default scheduler class
-   
+    def_scheduler = sch.DefaultScheduler()
+ 
     if choice == 1:
-        # Random Scheduler
         scheduled_equip = def_scheduler.random_sel(shovels)
     elif choice == 2:
-        # Fixed Scheduler
-        scheduled_equip = def_scheduler.fixed(truck_id,Num_trucks, shovels)
+        scheduled_equip = def_scheduler.fixed(truck_id, Num_trucks, shovels)
     elif choice == 3:
-        # Shortest Queue
-        scheduled_equip = def_scheduler.shortest_queue(shovels)
+        scheduled_equip = def_scheduler.shortest_queue_first(shovels)
+    elif choice == 4:
+        # MSWT reads cumulative per-shovel idle time maintained by the
+        # TrackIdleTime salabim component (see class TrackIdleTime in this
+        # file). The dict is keyed by shovel.name() and ticks every 5 sim
+        # units, which is finer-grained than the truck loading cycle so
+        # dispatch decisions always see a recent value.
+        scheduled_equip = def_scheduler.min_shovel_waiting_time(
+            shovels, shovel_idle_times
+        )
     else:
-        raise ValueError("Choice must be 1, 2 or 3")
-     
-    # Return the updated values of all variables
+        raise ValueError("Choice must be one of {1, 2, 3, 4}")
+ 
     return scheduled_equip
 
 def print_episode_summary():
@@ -234,9 +322,8 @@ def print_episode_summary():
             print(f"    Zone2-Crush: {sz2c:.2f}, Zone2-Dump: {sz2d:.2f}")
             print(f"    Zone3-Crush: {sz3c:.2f}, Zone3-Dump: {sz3d:.2f}")
         except KeyError:
-            pass # Silent fail if these aren't in the config
+            pass  # not in config
 
-        # Equipment-specific operational parameters
         try:
             trdm = cfg_samp.get_sampled_value('TRDM')
             trcr = cfg_samp.get_sampled_value('TRCR')
@@ -244,7 +331,6 @@ def print_episode_summary():
         except KeyError:
             pass
 
-        # Base reliability parameters
         try:
             rsh = cfg_samp.get_sampled_value('RSH')
             rtr = cfg_samp.get_sampled_value('RTR')
@@ -253,8 +339,7 @@ def print_episode_summary():
             print(f"  Base MTTR: Shovel: {rsh:.2f}, Truck: {rtr:.2f}, Crusher: {rcr:.2f}, Dump: {rds:.2f}")
         except KeyError:
             pass
-            
-        # Cost parameters
+
         try:
             known_cost = cfg_samp.get_sampled_value('known_cost')
             estimated_cost = cfg_samp.get_sampled_value('estimated_cost')
@@ -262,7 +347,6 @@ def print_episode_summary():
         except KeyError:
             pass
 
-        # Equipment performance variations
         try:
             trl_c1 = cfg_samp.get_sampled_value('TRL_C1')
             trl_c2 = cfg_samp.get_sampled_value('TRL_C2')
@@ -271,7 +355,6 @@ def print_episode_summary():
         except KeyError:
             pass
 
-        # Daily operational conditions
         try:
             fw = cfg_samp.get_sampled_value('FW')
             fo = cfg_samp.get_sampled_value('FO')
@@ -282,8 +365,7 @@ def print_episode_summary():
             print(f"  Truck Speeds: Empty: {te:.2f}, Loaded: {tl:.2f}")
         except KeyError:
             pass
-            
-        # Equipment health status
+
         try:
             fsh = cfg_samp.get_sampled_value('FSH')
             ftr = cfg_samp.get_sampled_value('FTR')
@@ -296,152 +378,49 @@ def print_episode_summary():
     except KeyError as e:
         print(f"Episode summary error: {e}")
 
-#------------CSV Updating -----------------------------------------------------------------------#
-#------------Write back Immediate and Final reward and corresponding Observed state vector-------#
-
 def update_csv_action(seq_id, action):
-    """ Read action from csv row and set READ flag """
-    global RL_sched, file_path
-
-    if RL_sched == False: #return if not doing RL scheduling
-        return 
-  
-    # First read the entire file
-    with open(file_path, mode='r', newline='') as file:
-        reader = csv.DictReader(file)
-        rows = list(reader)
-        fieldnames = reader.fieldnames
-
-    # Find and update the row with matching seq_id and action
-    for row in rows:
-        if row['Seq. no'] == seq_id and row['Action'] == action:
-            row['Read'] = 'True'
-
-    rows = [{ki: vi for ki, vi in row.items() if ki in fieldnames} for row in rows]
-
-    # Write all rows back with a single write operation - which avoids truncation
-    with open(file_path, mode='w', newline='') as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()  # Write the header
-        writer.writerows(rows)  # Write all rows
-        file.flush()  # Ensure data is written to disk
-
-    print(f"Code DES: Updated 'Read' flag in CSV for seq_id {seq_id} with action {action}.")
-    time.sleep(0.1)  # Small delay to let other processes access the file
-
+    """
+    Legacy no-op kept for backward compatibility. 
+    """
+    return
 
 
 def update_empty_obs_rew_row(observ, r_imm_d_pt, info, max_retries=10, retry_delay=1):
-    """Update row with Observation and IMMediate Reward """ 
-    global RL_sched, sim_exit, file_path
+    """
+    Deliver the (observation, immediate reward) for the current decision
+    point to the Gym/RL side via the in-process channel (terminated=False)
+    -- the 'next state + reward' half of one (s, a, r, s') transition. The
+    matching action is consumed right after in Truck.process().
+    """
+    global RL_sched, sim_exit, _channel
 
-    if RL_sched == False or sim_exit: #return if not doing RL scheduling or simulation is exiting
-        return 
+    if RL_sched == False or sim_exit or _channel is None:
+        return
 
-    retry_count = 0
-    while retry_count < max_retries:
-        try:
-            # Read all rows at once
-            with open(file_path, mode='r', newline='') as file:
-                reader = csv.DictReader(file)
-                rows = list(reader)
-                fieldnames = reader.fieldnames
-
-            # Find the first row where Observation and Reward are empty
-            updated = False
-            for row in rows:
-                if row['Observation'] == '' and row['Reward'] == '':
-                    row['Observation'] = json.dumps(observ)
-                    row['Reward'] = str(r_imm_d_pt)
-                    row['Info'] = json.dumps(info)
-                    row['Terminated'] = 'FALSE'
-                    updated = True
-                    break
-            
-            if updated:
-                # Write all data back in a single operation - prevents truncation
-                with open(file_path, mode='w', newline='') as file:
-                    writer = csv.DictWriter(file, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(rows)
-                    file.flush()
-
-                print("\n *Code DES: Updated row with immediate reward")
-                return
-            else:
-                print("\n Code DES: No row found with empty Observation and Reward columns. Retrying...")
-                retry_count += 1
-                time.sleep(retry_delay)
-                
-        except Exception as e:
-            print(f"Error updating CSV: {e}")
-            retry_count += 1
-            time.sleep(retry_delay)
-
-    print("Maximum retries reached. No update made.")
-    sys.exit()
+    _channel.send_result(observ, r_imm_d_pt, terminated=False, info=info)
+    _vprint(1, "\n *Code DES: sent observation + immediate reward to RL (in-process)")
     
 
 
 def final_step_update(observ, r_epi, info, max_retries=10, retry_delay=1):
-    """Update with Observation and TERminal Reward"""
-    global RL_sched, file_path
+    """
+    Deliver the terminal (observation, episode reward) to the Gym/RL side
+    and flag the episode as done, via the in-process channel
+    (terminated=True) -- answers the Gym's one pending action, since the
+    Gym is always exactly one action ahead and blocked awaiting a result.
+    """
+    global RL_sched, _channel
 
-    if RL_sched == False: #return if not doing RL scheduling
-        return 
+    if RL_sched == False or _channel is None:
+        return
 
-    retry_count = 0
-    while retry_count < max_retries:
-        try:
-            # Read all rows at once
-            with open(file_path, mode='r', newline='') as file:
-                reader = csv.DictReader(file)
-                rows = list(reader)
-                fieldnames = reader.fieldnames
-
-            # Find the first row where Observation and Reward are empty
-            updated = False
-            for row in rows:
-                if row['Observation'] == '' and row['Reward'] == '':
-                    row['Observation'] = json.dumps(observ)
-                    row['Reward'] = str(r_epi)
-                    row['Info'] = json.dumps(info)
-                    row['Terminated'] = 'TRUE'
-                    updated = True
-                    break
-            
-            if updated:
-                # Write all data back in a single operation - prevents truncation
-                with open(file_path, mode='w', newline='') as file:
-                    writer = csv.DictWriter(file, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(rows)
-                    file.flush()
-
-                print("\n *Code DES: Updated row with end of episode reward")
-                return
-            else:
-                print("\n Code DES: No row found with empty Observation and Reward columns. Retrying...")
-                retry_count += 1
-                time.sleep(retry_delay)
-                
-        except Exception as e:
-            print(f"Error updating CSV: {e}")
-            retry_count += 1
-            time.sleep(retry_delay)
-
-    print("Maximum retries reached. No update made.")
-
-#-----------end_of_csv_writing---------------------------------------------------#
+    _channel.send_result(observ, r_epi, terminated=True, info=info)
+    print("\n *Code DES: sent terminal observation + episode reward to RL (in-process)")
 
 
 def get_shovel_from_integer(shovel_list, index):
-    """
-    Given a list of shovel objects and an integer, return the corresponding shovel object.
-    :param shovel_list: List of shovel objects
-    :param index: Integer index corresponding to a shovel in the list
-    :return: Corresponding shovel object or None if index is out of bounds
-    """
+    """Return the shovel object at `index` in `shovel_list`, or None if
+    out of bounds."""
     if 0 <= index < len(shovel_list):
         return shovel_list[index]
     else:
@@ -450,43 +429,32 @@ def get_shovel_from_integer(shovel_list, index):
 
 
 def create_observation(num_shovels, num_trucks, shovel_data, active_truck_data, fleet_summary):
-    '''
-    Takes dictionaries of shovel_data, active_truck_data, and fleet_summary
-    Returns formatted observation vector for Gym with fleet context
-    
-    Args:
-        num_shovels: Number of shovels in the mine
-        num_trucks: Total number of trucks in the fleet
-        shovel_data: List of tuples [(queue_len, status), ...] for each shovel
-        active_truck_data: Dict with single truck's data {truck_name: {'trip_count': X, 'phase': 'XXX'}}
-        fleet_summary: Dict with {'avg_trips': float, 'recent_decisions': deque, 'diversity_score': float}
-    
-    Returns:
-        observation: Dict with all observation components as lists
-    '''
-    
-    # --- SHOVEL STATE ---
+    """
+    Build the Gym observation dict from shovel_data (list of
+    (queue_len, status) tuples), active_truck_data (single truck's
+    {'trip_count', 'phase'}), and fleet_summary ({'avg_trips',
+    'recent_decisions', 'diversity_score'}).
+    """
     shovel_id = np.zeros(num_shovels * 4, dtype=int)
     queue_length = np.zeros(num_shovels, dtype=float)
     sh_status = np.zeros(num_shovels, dtype=int)
-    
-    # Populate shovel data with bounded normalization
+
     for i, (queue_len, status) in enumerate(shovel_data):
-        # FIX: Bounded queue normalization (handles extreme congestion)
-        max_queue = num_trucks * 2
+        # Bounded by a few trucks-per-shovel (not 2*num_trucks) so real
+        # queue spreads (0-50) land in the middle of [0,1] instead of the
+        # bottom ~0-0.42, where small differences are hard to discriminate.
+        # Still clipped to 1.0 against rare congestion spikes.
+        max_queue = max((num_trucks / max(num_shovels, 1)) * 3.0, 10.0)
         queue_length[i] = round(min(queue_len / max_queue, 1.0), 4)
         sh_status[i] = status
-        
-        # Binary encoding of shovel ID (4 bits supports up to 16 shovels)
-        bin_str = format(i + 1, '04b')
+
+        bin_str = format(i + 1, '04b')  # 4 bits supports up to 16 shovels
         shovel_id[i * 4:i * 4 + 4] = list(map(int, bin_str))
 
-    # --- ACTIVE TRUCK STATE ---
     truck_id_active = np.zeros(1 * 6, dtype=int) 
     trips_complete_active = np.zeros(1, dtype=float)
     tr_status_active = np.zeros(1 * 3, dtype=int)
 
-    # Extract the single active truck's data
     truck_key = list(active_truck_data.keys())[0]
     truck_info = active_truck_data[truck_key]
     
@@ -494,90 +462,105 @@ def create_observation(num_shovels, num_trucks, shovel_data, active_truck_data, 
     trip_count = truck_info['trip_count']
     phase = truck_info['phase']
     truck_index = int(truck_key.split('.')[1]) - 1
-    
-    # Binary encoding of truck ID (6 bits supports up to 64 trucks)
-    binary_index = f'{truck_index + 1:06b}'
+
+    binary_index = f'{truck_index + 1:06b}'  # 6 bits supports up to 64 trucks
     truck_id_active[0:6] = list(map(int, binary_index))
-    
-    # Normalize trip count
     trips_complete_active[0] = round(trip_count / 500, 4)
-    
-    # Convert phase string to binary list
+
     phase_list = [int(char) for char in phase]
     tr_status_active[0:3] = phase_list
 
-    # --- FLEET CONTEXT (NEW: Essential for coordination) ---
-    
-    # 1. Fleet average trip progress (scalar)
+    # Fleet context: average trip progress, recent shovel usage
+    # distribution, and a diversity score, all for coordination.
     fleet_avg_trips = np.zeros(1, dtype=float)
     fleet_avg_trips[0] = round(fleet_summary['avg_trips'] / 500, 4)
-    
-    # 2. Recent shovel usage distribution (vector showing fleet behavior)
+
     recent_shovel_usage = np.zeros(num_shovels, dtype=float)
     if len(fleet_summary['recent_decisions']) >= 5:
-        # Look at last 10 decisions to see distribution
         recent_window = list(fleet_summary['recent_decisions'])[-10:]
         recent_counts = Counter(recent_window)
         
         for shovel_name, count in recent_counts.items():
-            # Extract shovel index from name like "Shovel_3"
-            idx = int(shovel_name.split('_')[1])
-            # Normalize by window size to get proportion
+            idx = int(shovel_name.split('_')[1])  # e.g. "Shovel_3" -> 3
             recent_shovel_usage[idx] = count / len(recent_window)
-    
-    # 3. Fleet diversity score (scalar indicating balance)
+
     fleet_diversity = np.zeros(1, dtype=float)
     fleet_diversity[0] = round(fleet_summary['diversity_score'], 4)
-    
-    # --- CREATE OBSERVATION DICTIONARY ---
+
     observation = {
-        # Shovel information
-        "ShovelID": shovel_id.tolist(),                      # num_shovels * 4 binary
-        "Queue_length": queue_length.tolist(),                # num_shovels floats
-        "SH_Status": sh_status.tolist(),                      # num_shovels binary
-        
-        # Active truck information
-        "TruckID_Active": truck_id_active.tolist(),           # 6 binary
-        "Trips_complete_Active": trips_complete_active.tolist(), # 1 float
-        "TR_Status_Active": tr_status_active.tolist(),        # 3 binary
-        
-        # Fleet context (NEW)
-        "Fleet_Avg_Trips": fleet_avg_trips.tolist(),          # 1 float
-        "Recent_Shovel_Usage": recent_shovel_usage.tolist(),  # num_shovels floats
-        "Fleet_Diversity": fleet_diversity.tolist()           # 1 float
+        "ShovelID": shovel_id.tolist(),
+        "Queue_length": queue_length.tolist(),
+        "SH_Status": sh_status.tolist(),
+
+        "TruckID_Active": truck_id_active.tolist(),
+        "Trips_complete_Active": trips_complete_active.tolist(),
+        "TR_Status_Active": tr_status_active.tolist(),
+
+        "Fleet_Avg_Trips": fleet_avg_trips.tolist(),
+        "Recent_Shovel_Usage": recent_shovel_usage.tolist(),
+        "Fleet_Diversity": fleet_diversity.tolist()
     }
-    
+
     return observation
 
 
 class RewardCalculator:
     def __init__(self, k, alpha=0.5):
         """
-        Initialize the RewardCalculator with a sliding window of length k.
-
-        Parameters:
-        k (int): Length of the sliding window to consider for averaging.
-        alpha (float): Exponential weighting factor. Controls the rate of increase of the weights.
+        k: sliding-window length for averaging. alpha: exponential
+        weighting factor controlling how fast the weights increase.
         """
         self.k = k
         self.alpha = alpha
         self.lamda = 0.1
-        self.trip_times = trip_times #deque(maxlen=k)
-        self.shovel_queues = shovel_queues #deque(maxlen=k)
-        self.TT_Avg_min = 10
-        self.TT_Avg_max = shift_dura
-        self.Q_Avg_d_min = 0.00001 #very small positive value
-        self.Q_Avg_d_max = 2 * shift_dura
+        self.trip_times = trip_times
+        self.shovel_queues = shovel_queues
+
+        self.PROD_W = 15.0
+
+        cycle_len = self._estimate_cycle_length()
+        self.TT_Avg_min = 0.0
+        self.TT_Avg_max = max(3.0 * cycle_len, 30.0)   # ~3 full truck cycles
+        self.Q_Avg_d_min = 0.0
+        self.Q_Avg_d_max = max(2.0 * cycle_len, 20.0)  # ~2 cycles worth of wait
+
+    @staticmethod
+    def _estimate_cycle_length():
+        """
+        Estimate a representative single-truck cycle length (load + haul to
+        crusher/dump + dump + haul back) from the sampled config parameters,
+        instead of hardcoding it. Falls back to a conservative default if the
+        config isn't available yet (e.g. at import time).
+        """
+        try:
+            load_times = [cfg_samp.get_sampled_value(f'TRL_C{c}') for c in (1, 2, 3)]
+            avg_load = sum(load_times) / len(load_times)
+
+            haul_keys = ['SZ1C', 'SZ1D', 'SZ2C', 'SZ2D', 'SZ3C', 'SZ3D']
+            haul_times = [cfg_samp.get_sampled_value(k) for k in haul_keys]
+            avg_haul_leg = sum(haul_times) / len(haul_times)
+
+            avg_dump = (cfg_samp.get_sampled_value('TRDM')
+                        + cfg_samp.get_sampled_value('TRCR')) / 2.0
+
+            # load + haul-out + dump + haul-back (haul-back approximated by the
+            # same average leg time, since empty/loaded speed differ but the
+            # distance is the same).
+            return avg_load + 2 * avg_haul_leg + avg_dump
+        except Exception:
+            return 30.0  # conservative fallback; only used if config sampling fails
 
     def min_max_normalize(self, current_value, min_value, max_value):
         """
-        Normalize a value using Min-Max normalization.
+        Normalize a value using Min-Max normalization, clipped to [0, 1] so an
+        occasional outlier (e.g. a queue spike during a multi-shovel breakdown)
+        cannot push the normalized value outside its intended range.
         """
         if max_value == min_value:
             raise ValueError("max_value and min_value cannot be the same")
-    
+
         normalized_value = (current_value - min_value) / (max_value - min_value)
-        return normalized_value
+        return max(0.0, min(1.0, normalized_value))
 
     def update(self, tau_d, Q_SH_d):
         """ Update the sliding window with the current decision point data """
@@ -602,30 +585,112 @@ class RewardCalculator:
         
         return weighted_avg
 
-    
-    def compute_r_imm_d(self):
-        """ Compute the immediate reward at the current decision point """
+    @staticmethod
+    def compute_dispatch_advantage(chosen_queue_len, all_queue_lens):
+        """
+        Action-consequential signal in [-1, +1]: +1 if the chosen shovel had
+        the shortest operational queue, -1 if it had the longest, linear in
+        between (symmetric, so "good dispatch" and "less bad dispatch" both
+        have a real gradient -- an earlier [-1, 0] form was structurally
+        pessimistic and taught the policy to spread uniformly rather than
+        pick well).
+
+        `all_queue_lens` should already be filtered to operational
+        (non-broken) shovels by the caller, so a broken shovel never sets
+        the bar an operational choice is judged against.
+        """
+        if not all_queue_lens:
+            return 0.0
+        best_alt = min(all_queue_lens)
+        spread = max(all_queue_lens) - best_alt
+        if spread <= 1e-9:
+            return 0.0  # every alternative was equally good; no signal here
+        advantage = 1.0 - 2.0 * (chosen_queue_len - best_alt) / spread
+        return max(-1.0, min(1.0, advantage))
+
+    def compute_r_imm_d(self, chosen_queue_len=None, all_queue_lens=None,
+                        trips_delta=0, chosen_shovel_id=None):
+        """
+        Compute the immediate, action-consequential reward at the current
+        decision point, as a dense, mostly-positive signal tied to the
+        action just taken:
+          - dispatch_term: how the chosen shovel compared to the best
+            available alternative (the core action-consequential signal --
+            load-spreading should emerge as a consequence of good
+            dispatching, not be forced by a separate regularizer).
+          - production_reward: a positive reward for each trip THIS truck
+            completed since its last decision (trips_delta, crusher AND
+            dump), credited here since under the lockstep (s, a, r, s')
+            protocol that trip is a consequence of the truck's previous
+            action. Crediting every completed trip (not just epsilon-routed
+            crusher trips) keeps the signal action-correlated and
+            low-variance.
+
+        diversity_penalty and streak_penalty terms are intentionally
+        absent from certain paths: once dispatch quality is rewarded
+        directly, spreading load is what a queue-aware policy does anyway.
+        """
         if len(self.trip_times) == 0 or len(self.shovel_queues) == 0:
-            return 0
+            return {'r_imm_d': 0.0, 'trip_times': [], 'shovel_queues': []}
 
-        TT_Avg = self.compute_weighted_average(self.trip_times)
-        Q_Avg_d = self.compute_weighted_average(self.shovel_queues)
-        TT_Avg_norm =  self.min_max_normalize(TT_Avg, self.TT_Avg_min, self.TT_Avg_max)
-        Q_Avg_d_norm =  self.min_max_normalize(Q_Avg_d, self.Q_Avg_d_min, self.Q_Avg_d_max)
 
-        # Four-component reward with explicit anti-streak mechanism
-        efficiency_penalty = -0.25 * TT_Avg_norm   # Increased weight (Credit Assignment) 0.15
-        queue_penalty = -0.15 * Q_Avg_d_norm       # Reduced weight (Covered by efficiency)
-        diversity_penalty = -0.30 * (1 - diversity_score())  #0.40
-        streak_penalty = -0.30 * calculate_streak_penalty()  # Reduced weight
-        
-        r_imm_d = efficiency_penalty + queue_penalty + diversity_penalty + streak_penalty
+        if chosen_queue_len is not None and all_queue_lens is not None:
+            dispatch_term = 1.0 * self.compute_dispatch_advantage(chosen_queue_len, all_queue_lens)
+            _spread = (max(all_queue_lens) - min(all_queue_lens)) if all_queue_lens else 0.0
+            _degenerate = _spread <= 1e-9
+        else:
+            dispatch_term = 0.0  # no dispatch info (truck's first decision this episode)
+            _spread = None
+            _degenerate = None
 
-        if len(all_trk_shv_dec) % 20 == 0:
+        try:
+            _streak_ratio = calculate_streak_penalty()
+            streak_term = -0.30 * _streak_ratio
+        except Exception:
+            _streak_ratio = None
+            streak_term = 0.0
+
+        try:
+            crush_so_far = globals().get('total_crush_trips', 0) or 0
+            pvol_now = crush_so_far * load_per_trip
+            progress = min(1.0, pvol_now / targ_pvol) if targ_pvol else 0.0
+            per_trip_reward = self.PROD_W * (load_per_trip / targ_pvol) * (1.0 + progress)
+        except Exception:
+            per_trip_reward = 0.0
+        production_reward = per_trip_reward * max(0, trips_delta)
+
+        r_imm_d = dispatch_term + production_reward + streak_term
+
+        # Per-decision dispatch diagnostics (separate CSV from the per-episode
+        # metrics log) -- lets the spread-zero / degenerate-case theory be
+        # checked empirically against real training data instead of guessed
+        # at. See episode_metrics_logger.log_dispatch_decision.
+        global rl_decision_index
+        rl_decision_index += 1
+        try:
+            log_dispatch_decision(
+                csv_path=_dispatch_log_path(),
+                episode=cfg_samp.episode_count if hasattr(cfg_samp, 'episode_count') else None,
+                decision_index=rl_decision_index,
+                chosen_queue_len=chosen_queue_len,
+                all_queue_lens=all_queue_lens,
+                spread=_spread,
+                degenerate=_degenerate,
+                dispatch_term=dispatch_term,
+                chosen_shovel_id=chosen_shovel_id,
+                num_operational=(len(all_queue_lens) if all_queue_lens else None),
+                streak_ratio=_streak_ratio,
+                streak_term=streak_term,
+                production_reward=production_reward,
+            )
+        except Exception:
+            pass  # never let diagnostic logging interrupt the simulation
+
+        if _DES_VERBOSE >= 2 and rl_decision_index % 20 == 0:
             episode_num = cfg_samp.episode_count if hasattr(cfg_samp, 'episode_count') else '?'
-            print(f"[Episode {episode_num}] Step {len(all_trk_shv_dec)}: "
-                  f"Eff: {-efficiency_penalty:.3f}, Queue: {-queue_penalty:.3f}, "
-                  f"Div: {diversity_score():.3f}, Reward: {r_imm_d:.4f}")
+            print(f"[Episode {episode_num}] Step {rl_decision_index}: "
+                  f"Dispatch: {dispatch_term:+.3f}, Streak: {streak_term:+.3f}, "
+                  f"ProdRew: {production_reward:+.4f}, Reward: {r_imm_d:+.4f}")
 
 
         return {
@@ -672,59 +737,59 @@ class ShovelWaitTimeTracker:
             average_times[shovel] = total_waiting_time / request_count if request_count > 0 else 0
         return average_times
 
-# Initialize the tracker
-#shovel_wait_time_tracker = ShovelWaitTimeTracker(Num_shovels)
-
-
-
-
 class Truck(sim.Component):
     scheduler_assigned = False
-    trucks_failed = 0  # Class variable to track number of trucks that have experienced breakdown
-    trucks_to_fail = None  # Class variable to store the IDs of trucks that will fail
-   
+    trucks_failed = 0     # count of trucks that have experienced breakdown
+    trucks_to_fail = None  # IDs of trucks that will fail
+
     def setup(self):
         global RL_sched, def_schdlr_choice, truck_breakdown_manager, Num_trucks
         global truck_last_trip_times
         global truck_trip_counts  
         global truck_phases       
 
-        self.truck_id = ''.join(filter(str.isdigit, self.name()))  # Extract truck ID
-
+        self.truck_id = ''.join(filter(str.isdigit, self.name()))
         self.trip_count = 0
-        self.truck_id = ''.join(filter(str.isdigit, self.name()))  # Extract truck ID
-        #truck_trip_counts[self.name()] = self.trip_count
-        #truck_last_trip_times[self.truck_id] = 0  # Initialize the last trip time for the truck
+        self.breakdown_display = None
 
-        self.breakdown_display = None  # Initialize display reference as None
-
-        # Initialize trucks_to_fail if not already done
         if Truck.trucks_to_fail is None:
             num_trucks_to_fail = min(int(cfg_samp.get_sampled_value('TTF')), Num_trucks)
-            # Randomly select which trucks will experience breakdowns
             Truck.trucks_to_fail = random.sample(range(1, Num_trucks + 1), num_trucks_to_fail)
-        
-        # Set initial breakdown time based on whether this truck is scheduled to fail
+
         if int(self.truck_id) in Truck.trucks_to_fail:
-            self.next_breakdown_time = cfg_samp.get_sampled_value('TIB')  # Each truck gets its own sampled TIB
+            self.next_breakdown_time = cfg_samp.get_sampled_value('TIB')
         else:
-            self.next_breakdown_time = float('inf')  # Trucks not scheduled to fail get infinity
+            self.next_breakdown_time = float('inf')
 
-
-        # Initial breakdown time based on TIB (Time to Initial Breakdown)
-        #self.next_breakdown_time = cfg_samp.get_sampled_value('TIB')
-        self.has_failed = False  # Track if this truck has had its first breakdown
-        #self.time_to_repair = cfg_samp.get_sampled_value('RSH')
+        self.has_failed = False
         self.time_to_repair = cfg_samp.get_sampled_value('RTR')
         self.phase = phase_shovel
         self.last_phase = None
-        self.shovel_name = None  # Track the shovel this truck is assigned to
-        self.truck_id = ''.join(filter(str.isdigit, self.name()))  # Extract truck ID
-        truck_trip_counts[self.name()] = self.trip_count # Add the truck to the global tracking dictionary
-        truck_last_trip_times[self.truck_id] = 0  # Initialize the last trip time for the truck
-        
-        # Instantiate RewardCalculator with a window size of 5 and alpha of 0.5
+        self.shovel_name = None
+        truck_trip_counts[self.name()] = self.trip_count
+        truck_last_trip_times[self.truck_id] = 0
+
         self.reward_calculator = RewardCalculator(k, alpha)
+
+        # (chosen_queue_len, alt_queue_lens) from this truck's most recent
+        # dispatch, consumed by compute_r_imm_d() at its next decision point.
+        self._pending_chosen_queue = None
+        self._pending_alt_queues = None
+        # Shovel index chosen at the most recent dispatch (for the
+        # dispatch-log diagnostic), consumed at the next decision point.
+        self._pending_chosen_shovel = None
+        # Per-truck (not global) crush-trip bookkeeping: a trip completed
+        # since this truck's last decision is a consequence of its own
+        # previous action, credited at its next decision point.
+        self.crush_trips_total = 0
+        self._crush_trips_at_last_decision = 0
+        # Per-truck ALL-trips bookkeeping (crusher + dump). This is what the
+        # production-progress reward is now credited on (see compute_r_imm_d),
+        # since every completed trip -- not just the epsilon-routed crusher
+        # ones -- is a direct consequence of dispatch quality. self.trip_count
+        # already increments once per completed cycle in process(); we only
+        # need to remember its value at the last decision to form the delta.
+        self._trips_at_last_decision = 0
 
     def handle_breakdown(self):
 
@@ -749,14 +814,12 @@ class Truck(sim.Component):
         global truck_phases
         self.phase = new_phase
         truck_phases[self.name()] = self.phase  # Update truck phase dictionary
-        #print(f"Truck {self.name()} phase updated to {self.phase}")  # Debug print
 
         # Add breakdown display when entering breakdown phase
         if new_phase == phase_broken_down:
             # Calculate even spacing using actual screen dimensions
             min_x = 400
             max_x = 600
-            #spacing = (max_x - min_x) / (Num_trucks - 1) if Num_trucks > 1 else 0
             spacing=10
             x_pos = min_x + (int(self.truck_id) - 1) * spacing
         
@@ -778,72 +841,68 @@ class Truck(sim.Component):
 
 
     def process(self):
-        global total_trips  # Declare as global to modify the global variable
+        global total_trips
         global total_crush_trips
         global r_imm_d_pt
-        first_trip = True  # Flag to indicate the first round
-        processed_items = set()  # Track processed truck IDs
+        first_trip = True
+        processed_items = set()
         seq_id=None
         action = None
                         
         while True:
-            
-            #seed = int(time.time() * 1000) % 4294967296
-            #self.env.random_seed(seed)
-            #trk_load = cfg_samp.get_sampled_value('TRL') 
-            
             while True:
-                #selected_shovel = random.choice(shovels)
                 curr_truck_id = ''.join(filter(str.isdigit, self.name()))
                 elapsed_time = env.now() - shift_start_time
                 time_left = shift_dura - elapsed_time
 
-                # Decide on the Shovel selection
-                # Truck uses default method for first scheduling round (Shortest Queue length)
-                # First trip - Classical mode
+                # First scheduling round uses the default method (shortest
+                # queue length) regardless of RL/classical mode.
                 if (first_trip == True and RL_sched == False):
-                    #print(f"\n Non-RL scheduling used: algo_choice={def_schdlr_choice} \n")
                     selected_shovel = scheduler_assign(def_schdlr_choice, truck_id=int(curr_truck_id))
                     first_trip = False
                     add_item(selected_shovel.name())
-    
-                # First trip - RL mode    
+
                 elif (first_trip == True and RL_sched == True):
-                    #print("\n Default scheduling used for RL first trip \n ")
                     selected_shovel = scheduler_assign(choice, truck_id=int(curr_truck_id))
                     first_trip = False
                     add_item(selected_shovel.name())
-                    
-                # RL Scheduling chosen
+
                 elif (first_trip == False and RL_sched == True):
-                    # Here the observation and reward is to be updated to the csv
-                    #---immediate reward calculation
-                    # Last trip times of each truck in the fleet
-                    #tau_d = sum(truck_last_trip_times.values()) / len(truck_last_trip_times) #tau_d, averaged over all trucks
                     tau_d = truck_last_trip_times[curr_truck_id]
 
-                    average_waiting_times = shovel_wait_time_tracker.get_average_waiting_times() # Average waiting times at individual shovels at 'current event'
-                    Q_SH_d  = sum(average_waiting_times.values()) / len(average_waiting_times) #Q_SH_d, averaged over all the shovels
-                    self.reward_calculator.update(tau_d, Q_SH_d) # Update the 'K event sliding window' with the current event data
-                    r_dict = self.reward_calculator.compute_r_imm_d()  # Compute the immediate reward at the current decision point
-                    r_imm_d_pt= r_dict['r_imm_d']  #Create immediate reward
+                    average_waiting_times = shovel_wait_time_tracker.get_average_waiting_times()
+                    Q_SH_d = sum(average_waiting_times.values()) / len(average_waiting_times)
+                    self.reward_calculator.update(tau_d, Q_SH_d)
 
-                    # *** OBSERVATION MISMATCH FIX ***
-                    # Only pass the data for the current truck (self) to create_observation
-                    # print_trip_counts(ppflag=0) returns ALL truck data. We need to filter it.
+                    # This truck's own throughput since its last decision --
+                    # a direct consequence of that action.
+                    trips_delta = self.trip_count - self._trips_at_last_decision
+                    self._trips_at_last_decision = self.trip_count
+                    r_dict = self.reward_calculator.compute_r_imm_d(
+                        chosen_queue_len=getattr(self, '_pending_chosen_queue', None),
+                        all_queue_lens=getattr(self, '_pending_alt_queues', None),
+                        trips_delta=trips_delta,
+                        chosen_shovel_id=getattr(self, '_pending_chosen_shovel', None),
+                    )
+                    r_imm_d_pt = r_dict['r_imm_d']
+                    self._pending_chosen_queue = None
+                    self._pending_alt_queues = None
+                    self._pending_chosen_shovel = None
+
+                    # print_trip_counts returns ALL truck data; observation
+                    # needs only the active truck's.
                     all_truck_data = print_trip_counts(ppflag=0)
-                    active_truck_data = {self.name(): all_truck_data[self.name()]} # Filter to only the active truck
+                    active_truck_data = {self.name(): all_truck_data[self.name()]}
 
                     all_trips = list(truck_trip_counts.values())
                     fleet_summary = {
                         'avg_trips': sum(all_trips) / len(all_trips) if all_trips else 0,
-                        'recent_decisions': all_trk_shv_dec,  # The global deque
+                        'recent_decisions': all_trk_shv_dec,
                         'diversity_score': diversity_score()
                     }
 
-                    #observ = create_observation(Num_shovels, Num_trucks, print_resource_status(pflag=0)['Shovels'], print_trip_counts(ppflag=0))
-                    observ = create_observation(Num_shovels, Num_trucks, print_resource_status(pflag=0)['Shovels'], active_truck_data,fleet_summary)
-
+                    shovel_status_snapshot = print_resource_status(pflag=0)['Shovels']
+                    observ = create_observation(Num_shovels, Num_trucks, shovel_status_snapshot, active_truck_data,fleet_summary)
 
                     info = {'truck_id': curr_truck_id}
 
@@ -851,50 +910,88 @@ class Truck(sim.Component):
                     if sim_exit:
                         break
                     else:
-                        # Update CSV with truck ID
+                        # Sends the (next-state, reward) half of this
+                        # (s, a, r, s') transition over the channel.
                         update_empty_obs_rew_row(observ, r_imm_d_pt, info)
 
+                    _vprint(1, "\n Querying RL Policy \n ")
+                    # Block for the action that answers this decision. The
+                    # channel verifies it matches the result just sent.
+                    #
+                    # THREAD-SAFETY: _RUN_DES_LOCK is held throughout runDes
+                    # so concurrent DES threads (eval episodes during
+                    # training) can't race on the module globals, but
+                    # blocking here while holding it would deadlock the eval
+                    # callback -- so this thread's globals are snapshotted,
+                    # the lock released for the wait, then reacquired and
+                    # the snapshot restored on wake-up, regardless of what
+                    # eval did to the globals during the gap.
+                    _snap_for_wait = _snapshot_des_globals()
+                    _RUN_DES_LOCK.release()
+                    try:
+                        action = _channel.wait_for_action()
+                    except ChannelStopped:
+                        # Reset/shutdown was requested; unwind cleanly.
+                        _RUN_DES_LOCK.acquire()
+                        _restore_des_globals(_snap_for_wait)
+                        sim_exit = True
+                        return
+                    else:
+                        _RUN_DES_LOCK.acquire()
+                        _restore_des_globals(_snap_for_wait)
 
-                    print("\n Querying RL Policy \n ")
-                    with open(file_path, mode='r') as file:
-                        reader = csv.reader(file)
-                        header = next(reader) #skip header row
-                        rows = list(reader)
-                        # Find the first row with a matching action but no truck ID
-                        for row in rows:
-                            seq_id = row[0] #Get sequence ID
-                            action = row[1] #Get action
-                            read_flag = row[2]  # Read column
+                    if action is None:
+                        sim_exit = True
+                        return
 
-                            if action and (not read_flag or read_flag.lower() == 'false'):  # Check if Action exists and Read flag is empty or False
-                                selected_shovel = get_shovel_from_integer(shovels, int(action))
-                                add_item(selected_shovel.name())
-                                print(f"\n\nCode DES: Received Action {action}.\n\n")
-                                row[2] = 'True'
-        
-                                # Assuming update_csv_action() function handles CSV update
-                                update_csv_action(seq_id,action)
-                                processed_items.add((seq_id, action))
-                                time.sleep(0.5)  # Sleep for 1 second to allow code AA to check the file
-                                #break  # Process only the first matching row
+                    selected_shovel = get_shovel_from_integer(shovels, int(action))
+                    add_item(selected_shovel.name())
+                    _vprint(1, f"\n\nCode DES: Received Action {action}.\n\n")
 
-                # Non-RL Scheduling chosen
-                #elif (first_trip is False and RL_sched is False):
+                    # Sanity check: with action masking active, this should
+                    # stay at 0 -- the agent should never be offered a
+                    # broken shovel. A live signal that masking is working
+                    # (jumps off zero if the mask wrapper is ever removed).
+                    global broken_shovel_dispatch_count
+                    chosen_idx_check = int(action)
+                    if (0 <= chosen_idx_check < len(shovel_status_snapshot)
+                            and shovel_status_snapshot[chosen_idx_check][1] == 0):
+                        broken_shovel_dispatch_count += 1
+                        print(f"WARNING: dispatched to broken shovel (action={action}) "
+                              f"-- action masking may not be active.")
+
+                    # Score the chosen shovel against operational
+                    # alternatives available at the instant of choice (only
+                    # operational shovels set the comparison bar). Stashed
+                    # here and consumed at this truck's next decision point,
+                    # per the lockstep (s, a, r, s') protocol.
+                    operational_queues = [q for (q, status) in shovel_status_snapshot if status == 1]
+                    chosen_idx = int(action)
+                    chosen_queue_len = (shovel_status_snapshot[chosen_idx][0]
+                                         if 0 <= chosen_idx < len(shovel_status_snapshot) else 0)
+                    self._pending_chosen_queue = chosen_queue_len
+                    self._pending_alt_queues = operational_queues
+                    self._pending_chosen_shovel = chosen_idx
+
+                    # Shovel-hugging monitor: record every RL choice, cheap
+                    # per-decision, summarized into concentration stats once
+                    # at episode end.
+                    global episode_shovel_choices, episode_queue_sum, episode_queue_count
+                    episode_shovel_choices[chosen_idx] = episode_shovel_choices.get(chosen_idx, 0) + 1
+                    episode_queue_sum += chosen_queue_len
+                    episode_queue_count += 1
+
                 elif (RL_sched == False):
-                    #print(f'Scheduler algo Choice" {def_schdlr_choice}')
                     selected_shovel = scheduler_assign(def_schdlr_choice, truck_id=int(curr_truck_id))  
-                    #print(f"[VERIFY] Truck {curr_truck_id} → {selected_shovel.name()} at time {env.now():.2f}")
                     add_item(selected_shovel.name())
 
                                
-                #print('Selected SHOVEL:'+str(selected_shovel))
                 self.shovel_name = selected_shovel.name()  # Set the shovel name
                 shovel_wait_time_tracker.add_truck_to_queue(self.shovel_name, env.now(), self.truck_id)
 
                 yield self.request((selected_shovel,1,4))
                 start_time = env.now()
 
-                # Get loading time based on selected shovel's performance class
                 try:
                     shovel_id = int(selected_shovel.name().split('_')[1])
                     shovel_classes = cfg_samp.get_sampled_value('shovel_performance_class')
@@ -914,72 +1011,64 @@ class Truck(sim.Component):
             shovel_wait_time_tracker.remove_truck_from_queue(self.shovel_name, env.now(), self.truck_id)
             self.release()
      
-            # Determine whether to go to a crusher or dump based on epsilon-greedy strategy
-            if random.random() < epsilon:  # Epsilon = 1 for Crusher only
-                #[Go To CRUSHER]
+            # Epsilon-greedy: epsilon=1 routes to crusher only.
+            if random.random() < epsilon:
                 self.update_phase(phase_travel_shovel_crusher) 
                 selected_crusher = random.choice(crushers)  
-                #norm_time_cr = cfg_samp.get_sampled_value('STC')  # Travel time to crusher
                 try:
                     shovel_id = int(selected_shovel.name().split('_')[1])
                     location_clusters = cfg_samp.get_sampled_value('shovel_location_cluster')
                     location_cluster = location_clusters[shovel_id]
-                    norm_time_cr = cfg_samp.get_sampled_value(f'SZ{location_cluster}C')  # Zone to Crusher
+                    norm_time_cr = cfg_samp.get_sampled_value(f'SZ{location_cluster}C')
                 except (KeyError, IndexError) as e:
                     print(f"ERROR: Could not get crusher travel time for shovel {selected_shovel.name()}: {e}")
 
                 vmax_rnd_cr = 300 / (norm_time_cr)
                 traj_c01 = sim.TrajectoryCircle(radius=200, x_center=750, y_center=600, angle0=230, angle1=360, v0=0, vmax=vmax_rnd_cr)
 
-                # Check for breakdown (on way to Crusher)
                 if self.handle_breakdown():
-                    #print(f"{self.name()} breaks down at {env.now():.2f}") 
                     self.passivate() 
                     curr_phase = self.phase
-                    self.update_phase(phase_broken_down) #Update truck state
+                    self.update_phase(phase_broken_down)
                     breakdown_start_time = env.now() 
-                    yield self.hold(self.time_to_repair)  # Repair time based on MTTR 
-                    #print(f"{self.name()} repaired at {env.now():.2f}") 
+                    yield self.hold(self.time_to_repair)
 
-                    # Keep track of repair time and update trajetory information
-                    # for animation purpose
+                    # Adjust travel-time/trajectory to include repair time,
+                    # for the animation to reflect the delay.
                     repair_end_time = env.now()
-                    repair_duration = repair_end_time - breakdown_start_time  # Calculate repair duration
-                    adjusted_time_cr = norm_time_cr + repair_duration  # Adjust travel time to include repair time
-                    vmax_rnd_cr = 300 / adjusted_time_cr  # Recalculate vmax_rnd_cr with adjusted travel time
-                    traj_c01 = sim.TrajectoryCircle(radius=200, x_center=750, y_center=600, angle0=230, angle1=360, v0=0, vmax=vmax_rnd_cr)  # Update trajectory with new vmax_rnd_cr
+                    repair_duration = repair_end_time - breakdown_start_time
+                    adjusted_time_cr = norm_time_cr + repair_duration
+                    vmax_rnd_cr = 300 / adjusted_time_cr
+                    traj_c01 = sim.TrajectoryCircle(radius=200, x_center=750, y_center=600, angle0=230, angle1=360, v0=0, vmax=vmax_rnd_cr)
 
                     self.activate()  
                     self.update_phase(curr_phase) 
-                    # Schedule next breakdown using FTR
                     self.next_breakdown_time = env.now() + cfg_samp.get_sampled_value('FTR')
 
-                # Animation and travel for crusher
                 txt = str(self.name())
                 num = txt.split('.')[-1]
                 self.dump_truck_cr = sim.AnimateImage("dump_truck_01.png", width=70, x=traj_c01.x, y=traj_c01.y, angle=traj_c01.angle, text=str(num), text_anchor="c", fontsize=20, textcolor="yellow")
                 yield self.hold(norm_time_cr)
                 self.dump_truck_cr.remove()
 
-                # Unloading in Crusher phase
                 yield self.request(selected_crusher)
                 crush_dump = cfg_samp.get_sampled_value('TRCR')
                 yield self.hold(crush_dump)
                 self.release()
 
-                # Increment counter right after crusher operation completes
                 global total_crush_trips
                 total_crush_trips += 1
+                # Per-truck count for the production reward, credited to
+                # this truck's previous dispatch at its next decision point.
+                self.crush_trips_total += 1
 
                 self.update_phase(phase_travel_crusher_shovel) 
-                
-                #Return to Shovel animate
-                #norm_time_rev_cr = cfg_samp.get_sampled_value('CTS') #Crusher to shovel travel time
+
                 try:
                     shovel_id = int(selected_shovel.name().split('_')[1])
                     location_clusters = cfg_samp.get_sampled_value('shovel_location_cluster')
                     location_cluster = location_clusters[shovel_id]
-                    norm_time_rev_cr = cfg_samp.get_sampled_value(f'SZ{location_cluster}C')  # Zone to Crusher (return)
+                    norm_time_rev_cr = cfg_samp.get_sampled_value(f'SZ{location_cluster}C')
                 except (KeyError, IndexError) as e:
                     print(f"ERROR: Could not get return travel time from crusher: {e}")
                 vmax_rnd_rev_cr = 330/ (norm_time_rev_cr)
@@ -988,73 +1077,56 @@ class Truck(sim.Component):
                 yield self.hold(norm_time_rev_cr)
                 self.dump_truck_cr_2.remove()
 
-                # Update last trip time for truck
                 truck_last_trip_times[self.truck_id] = norm_time_cr + crush_dump + norm_time_rev_cr
 
-
             else:
-                #[Go To DUMP SITE]
-
                 self.update_phase(phase_travel_shovel_dump)  
 
                 selected_dump = random.choice(dumps)
-                # Define trajectory for traveling to a dump
-                #norm_time = cfg_samp.get_sampled_value('STD')  # Travel to dump time
                 try:
                     shovel_id = int(selected_shovel.name().split('_')[1])
                     location_clusters = cfg_samp.get_sampled_value('shovel_location_cluster')
                     location_cluster = location_clusters[shovel_id]
-                    norm_time = cfg_samp.get_sampled_value(f'SZ{location_cluster}D')  # Zone to Dump
+                    norm_time = cfg_samp.get_sampled_value(f'SZ{location_cluster}D')
                 except (KeyError, IndexError) as e:
                     print(f"ERROR: Could not get dump travel time for shovel {selected_shovel.name()}: {e}")
                 vmax_rnd = 830 / norm_time
                 traj_03 = sim.TrajectoryCircle(radius=230, x_center=300, y_center=470, angle0=360, angle1=150, vmax=vmax_rnd)
 
-                #Check for breakdown ( on way to Dumping Site)
                 if self.handle_breakdown():
-                    #print(f"{self.name()} breaks down at {env.now():.2f}") 
                     self.passivate() 
                     curr_phase = self.phase
-                    self.update_phase(phase_broken_down)  #Update truck state
+                    self.update_phase(phase_broken_down)
                     breakdown_start_time = env.now() 
-                    yield self.hold(self.time_to_repair)  # Repair time based on MTTR 
-                    #print(f"{self.name()} repaired at {env.now():.2f}") 
+                    yield self.hold(self.time_to_repair)
 
-                    # Keep track of repair time and update trajetory information
-                    # for animation purpose
                     repair_end_time = env.now()
-                    repair_duration = repair_end_time - breakdown_start_time  # Calculate repair duration
-                    adjusted_time = norm_time + repair_duration  # Adjust travel time to include repair time
-                    vmax_rnd = 830 / adjusted_time  # Recalculate vmax_rnd with adjusted travel time
-                    traj_03 = sim.TrajectoryCircle(radius=230, x_center=300, y_center=470, angle0=360, angle1=150, vmax=vmax_rnd)  # Update trajectory with new vmax_rnd
+                    repair_duration = repair_end_time - breakdown_start_time
+                    adjusted_time = norm_time + repair_duration
+                    vmax_rnd = 830 / adjusted_time
+                    traj_03 = sim.TrajectoryCircle(radius=230, x_center=300, y_center=470, angle0=360, angle1=150, vmax=vmax_rnd)
 
                     self.activate() 
                     self.update_phase(curr_phase) 
-                    # Schedule next breakdown using FTR
                     self.next_breakdown_time = env.now() + cfg_samp.get_sampled_value('FTR')
 
-                # Animation and travel to dump
                 txt = str(self.name())
                 num = txt.split('.')[-1]
                 self.dump_truck_ds = sim.AnimateImage("dump_truck_01.png", width=70, x=traj_03.x, y=traj_03.y, angle=traj_03.angle, text=str(num), text_anchor="c", fontsize=20, textcolor="yellow")   
                 yield self.hold(norm_time)
                 self.dump_truck_ds.remove()
 
-                # Dumping phase
                 yield self.request(selected_dump)
                 dump_time = cfg_samp.get_sampled_value('TRDM')
                 yield self.hold(dump_time)
                 self.release()
-                self.update_phase(phase_travel_dump_shovel)  # << Added
-                
-                #Return to Shovel animate
-                #norm_time_rev = max(1,sim.Normal(40,10).sample())
-                #norm_time_rev = cfg_samp.get_sampled_value('DTS')
+                self.update_phase(phase_travel_dump_shovel)
+
                 try:
                     shovel_id = int(selected_shovel.name().split('_')[1])
                     location_clusters = cfg_samp.get_sampled_value('shovel_location_cluster')
                     location_cluster = location_clusters[shovel_id]
-                    norm_time_rev = cfg_samp.get_sampled_value(f'SZ{location_cluster}D')  # Zone to Dump (return)
+                    norm_time_rev = cfg_samp.get_sampled_value(f'SZ{location_cluster}D')
                 except (KeyError, IndexError) as e:
                     print(f"ERROR: Could not get return travel time from dump: {e}")
                 vmax_rnd_rev = 330/ (norm_time_rev)
@@ -1062,22 +1134,15 @@ class Truck(sim.Component):
                 self.dump_truck_2 = sim.AnimateImage("dump_truck_02.png", width=70, x=traj_04.x, y=traj_04.y,angle=traj_04.angle,text=str(num), text_anchor = "c", fontsize= 20, textcolor = "red")
                 yield self.hold(norm_time_rev)
                 self.dump_truck_2.remove()
-               
-                # Update last trip time for truck
+
                 truck_last_trip_times[self.truck_id] = norm_time + dump_time + norm_time_rev
 
-
-            # Increment trip count
             self.trip_count += 1
             truck_trip_counts[self.name()] = self.trip_count
 
-            # Update total trips
             global total_trips
             total_trips = sum(truck_trip_counts.values())
 
-
-
-#---Shovel Breakdown event handling -----
 
 class BreakdownManager(sim.Component):
     def __init__(self, *args, **kwargs):
@@ -1087,26 +1152,22 @@ class BreakdownManager(sim.Component):
         self.shovel_breakdowns = []
     
     def _select_shovels_to_fail(self):
-        """Centralized selection of which shovels should fail with their unique initial breakdown times"""
+        """Select which shovels fail this episode, with unique jittered
+        initial breakdown times so failures don't all trigger at once."""
         num_shovels = cfg_samp.get_sampled_value('SH')
         num_shovels_to_fail = min(int(cfg_samp.get_sampled_value('STF')), num_shovels)
-        
-        # Get all shovel IDs
+
         shovel_ids = [int(s.name().split('_')[1]) for s in shovels]
-        
-        # Randomly select shovels to fail
         shovels_to_fail = random.sample(shovel_ids, num_shovels_to_fail)
-        
-        # Sample initial breakdown times for each failing shovel with timing separation
+
         breakdown_schedule = {}
         for s in shovels:
             shovel_id = int(s.name().split('_')[1])
             if shovel_id in shovels_to_fail:
-                # Get unique initial breakdown time for this shovel with jitter
                 base_time = cfg_samp.get_sampled_value('SIB')
-                jitter = random.uniform(0, 50)  # Add random jitter between 0-10 time units
+                jitter = random.uniform(0, 50)
                 initial_breakdown = base_time + jitter
-                
+
                 breakdown_schedule[s.name()] = {
                     'should_fail': True,
                     'initial_breakdown': initial_breakdown
@@ -1126,17 +1187,14 @@ class BreakdownManager(sim.Component):
 
     def process(self):
         try:
-            # Centrally determine which shovels should fail and their schedules
             breakdown_schedule = self._select_shovels_to_fail()
-            
-            # Create individual breakdown components for each shovel with timing separation
+
             for idx, shovel in enumerate(shovels):
                 schedule = breakdown_schedule[shovel.name()]
-                
-                # Add small delay between component creation to ensure temporal separation
-                if idx > 0:
+
+                if idx > 0:  # small delay for temporal separation
                     yield self.hold(random.uniform(0.1, 0.5))
-                
+
                 breakdown = IndividualShovelBreakdown(
                     shovel=shovel,
                     shovel_animations=shovel_animations,
@@ -1144,9 +1202,9 @@ class BreakdownManager(sim.Component):
                     initial_breakdown_time=schedule['initial_breakdown']
                 )
                 self.shovel_breakdowns.append(breakdown)
-            
-            yield self.passivate()  # Manager becomes passive after creating breakdown components
-            
+
+            yield self.passivate()
+
         except Exception as e:
             print(f"Error in BreakdownManager process: {str(e)}")
             raise
@@ -1160,8 +1218,7 @@ class IndividualShovelBreakdown(sim.Component):
         self.has_failed = False
         self.is_broken = False
         self.should_fail = should_fail
-        
-        # Use provided initial breakdown time if shovel should fail
+
         if self.should_fail:
             self.next_breakdown_time = initial_breakdown_time
             print(f"{self.shovel.name()}: Initial breakdown scheduled at {self.next_breakdown_time}")
@@ -1172,30 +1229,24 @@ class IndividualShovelBreakdown(sim.Component):
         try:
             while True:
                 if not self.has_failed and self.should_fail:
-                    # Wait until breakdown time
                     time_until_breakdown = max(0, self.next_breakdown_time - self.env.now())
                     if time_until_breakdown > 0:
                         yield self.hold(time_until_breakdown)
 
-                    # Handle breakdown
                     yield self.request((self.shovel, 1, 1))
                     print(f"\nShovel {self.shovel.name()} breaking down at time {self.env.now()}")
-                    
-                    # Calculate repair time with small random variation
+
                     base_repair_time = cfg_samp.get_sampled_value('RSH')
-                    repair_time = base_repair_time + random.uniform(0, 5)  # Add up to 5 time units of variation
-                    
+                    repair_time = base_repair_time + random.uniform(0, 5)
+
                     self.has_failed = True
                     self.is_broken = True
-                    
-                    # Update animation
+
                     self.shovel_animations[self.shovel].image = "shovel_broken.png"
                     print(f"Repair time for {self.shovel.name()}: {repair_time:.2f}")
-                    
-                    # Wait for repair
+
                     yield self.hold(repair_time)
-                    
-                    # Repair complete
+
                     self.shovel_animations[self.shovel].image = "shovel_active.png"
                     self.release()
                     self.is_broken = False
@@ -1207,11 +1258,9 @@ class IndividualShovelBreakdown(sim.Component):
                     print(f"Next breakdown for {self.shovel.name()} scheduled at {self.next_breakdown_time}")
                 
                 else:
-                    # Wait until next shift
                     time_until_next_shift = shift_dura - (self.env.now() % shift_dura)
                     yield self.hold(time_until_next_shift)
-                    
-                    # Reset for next shift
+
                     self.has_failed = False
                     if self.should_fail:
                         base_time = cfg_samp.get_sampled_value('SIB')
@@ -1224,165 +1273,196 @@ class IndividualShovelBreakdown(sim.Component):
             raise
 
 
-#--Trace printing methods...
-def print_trip_counts(ppflag=1):
-    truck_info = {} #Dictionary to store truck information
-    #print("\nTruck ID | Total Trips | Current Phase")
-    #print("--------------------------------------")
-    for truck_id, trip_count in truck_trip_counts.items():
-        phase = truck_phases.get(truck_id, '000')  # Get the phase for the truck, default to "Unknown" if not found
-        truck_info[truck_id] = {'trip_count': trip_count, 'phase': phase}
+# --- Trace / snapshot helpers -----------------------------------------------
+# `ppflag` / `pflag` are kept for backward compatibility with existing call
+# sites (both are always invoked with the flag set to 0 on the live decision
+# path). Verbose console printing has been retired in favor of the
+# DES_VERBOSE gate defined near the top of this module.
 
-        if ppflag == 1:
-            pass
-            #print(f"{truck_id:8} | {trip_count:11} | {phase}")
-        else:
-            pass
-    total_trips = sum(truck_trip_counts.values())
-    #print(f"\n **Total number of trips made by all trucks: {total_trips}")
+def print_trip_counts(ppflag=1):
+    """Return {truck_id: {'trip_count': int, 'phase': str}} for every truck."""
+    truck_info = {}
+    for truck_id, trip_count in truck_trip_counts.items():
+        phase = truck_phases.get(truck_id, '000')
+        truck_info[truck_id] = {'trip_count': trip_count, 'phase': phase}
     return truck_info
 
 
-
-# Event to print truck trip counts every 100 units of time
 class PrintTripCountsEvent(sim.Component):
+    """Periodically refreshes the truck-trip-count snapshot."""
     def process(self):
         while True:
-            yield self.hold(5)  # Wait for 100 units of time
+            yield self.hold(5)
             print_trip_counts()
 
+
 class TrackIdleTime(sim.Component):
+    """Accumulates per-shovel idle time between checks."""
     def process(self):
         while True:
-            yield self.hold(5)  # Check every time unit
+            yield self.hold(5)
             current_time = env.now()
             for shovel in shovels:
                 if not shovel.claimers():
                     shovel_idle_times[shovel.name()] += current_time - shovel_last_check[shovel.name()]
                 shovel_last_check[shovel.name()] = current_time
 
+
 class PrintShovelIdleTimes(sim.Component):
+    """Recomputes the fleet-average shovel idle time."""
     def process(self):
         while True:
-            yield self.hold(1)  # Wait for 100 units of time
-            #print("\nShovel ID | Idle Time")
-            #print("----------------------")
-            for shovel in shovels:
-                idle_time = shovel_idle_times[shovel.name()]
-                #print(f"{shovel.name():8} | {idle_time:10.2f}")
-
+            yield self.hold(1)
             global avg_idle_orig_time
-            avg_idle_orig_time = sum(shovel_idle_times.values())/len(shovels)
-            #print(f"Total shovel idle time: {avg_idle_orig_time}")
+            avg_idle_orig_time = sum(shovel_idle_times.values()) / len(shovels)
+
 
 class PrintClaimersStatusEvent(sim.Component):
+    """Periodically refreshes the resource-status snapshot."""
     def process(self):
         while True:
-            yield self.hold(10)  # Wait for 100 units of time
+            yield self.hold(10)
             print_resource_status()
 
+
 def print_resource_status(pflag=1):
-    if pflag==1:
-        pass
-        #print("\nResource Status:")
-        #print("-----------------")
-    else:
-        pass
-    
+    """Snapshot claimer/requester counts and breakdown status for every
+    shovel, crusher, and dump, keyed as
+    {'Shovels': [(total, status), ...], 'Crushers': [...], 'Dumps': [...]}.
+    """
     resource_status = {}
 
     def is_resource_broken_down(resource):
-        # Check if the claimer has a 'name' attribute
-        srn = str(resource.claimers().head())
-        return 'breakdownevent' in srn
+        return 'breakdownevent' in str(resource.claimers().head())
 
-    # Print Shovel claimers and status
-    #print("\nShovels:")
     resource_status['Shovels'] = []
-
     for shovel in shovels:
-        claimers = list(shovel.claimers())
-        num_claimers = len(claimers)
-        num_requesters = len(list(shovel.requesters()))
-        total = num_claimers + num_requesters
+        total = len(list(shovel.claimers())) + len(list(shovel.requesters()))
         status = 1 if not is_resource_broken_down(shovel) else 0
         resource_status['Shovels'].append((total, status))
-        if pflag==1:
-            pass
-            #print(f"{shovel.name()}: ({total}, {status})")
-        else:
-            pass
 
-    
-    # Print Crusher claimers and status
-    #print("\nCrushers:")
     resource_status['Crushers'] = []
-
     for crusher in crushers:
-        claimers = list(crusher.claimers())
-        num_claimers = len(claimers)
-        num_requesters = len(list(crusher.requesters()))
-        total = num_claimers + num_requesters
+        total = len(list(crusher.claimers())) + len(list(crusher.requesters()))
         status = 1 if not is_resource_broken_down(crusher) else 0
         resource_status['Crushers'].append((total, status))
-        if pflag==1:
-            pass
-            #print(f"{crusher.name()}: ({total}, {status})")
-        else:
-            pass
-    
-    # Print Dump claimers and status
-    #print("\nDumps:")
-    resource_status['Dumps'] = []
 
+    resource_status['Dumps'] = []
     for dump in dumps:
-        claimers = list(dump.claimers())
-        num_claimers = len(claimers)
-        num_requesters = len(list(dump.requesters()))
-        total = num_claimers + num_requesters
+        total = len(list(dump.claimers())) + len(list(dump.requesters()))
         status = 1 if not is_resource_broken_down(dump) else 0
         resource_status['Dumps'].append((total, status))
-        if pflag==1:
-            pass
-            #print(f"{dump.name()}: ({total}, {status})")
-        else:
-            pass
 
     return resource_status
 
 
 
+# Global lock so concurrent KPICalculator instances (e.g. an eval thread and
+# a train thread, if that ever overlaps) don't interleave rows mid-write to
+# the same shared KPI log file.
+_KPI_WRITE_LOCK = threading.Lock()
+
+
 class KPICalculator(sim.Component):
-    #def setup(self):
-    def setup(self, scenario_name=None, seed=None):
+    """
+    Per-tick KPI logger. One row every HIGH_FREQ sim-minutes plus extra
+    rows on equipment state changes.
+
+    Updated for multi-episode play/eval runs:
+      1. Accepts an external `csv_path` (the same path runDes already
+         receives) so every episode in a play/eval run appends to ONE file
+         instead of each episode getting its own timestamped file.
+      2. Adds Episode / Scenario / Seed columns for provenance --
+         downstream aggregation groups on Episode instead of globbing many
+         files.
+      3. Append-safe across episodes: header is written exactly once (when
+         the file does not yet exist or is empty); subsequent
+         KPICalculator instances attach to the same file without
+         truncating it.
+      4. Filename fallback (when no csv_path is passed) preserves the old
+         timestamped behavior, so legacy callers are unaffected.
+
+    `episode_idx` is passed in by the caller (GymEnv forwards its own
+    self._episode_counter through runDes). We deliberately do NOT maintain
+    a second counter here -- duplicating that state would be a source of
+    drift between the GymEnv's episode count and what gets logged.
+    """
+
+    HEADERS_BASE = [
+        'Episode',
+        'Scenario',
+        'Seed',
+        'Timestamp',
+        'Shift_Number',
+        'Shovel_Queue_Lengths',
+        'Crusher_Queue_Lengths',
+        'Dump_Queue_Lengths',
+        'Changed_Shovel',
+        'New_State',
+        'Changed_Truck',
+        'New_State_Truck',
+        'Trips_Per_Hour',
+        'Production_Volume_Per_Hour',
+        'Total_Production_Volume',
+        'Cost_Per_Ton',
+        'Total_Fuel_Consumption',
+    ]
+
+    @staticmethod
+    def _derive_kpi_path(csv_path, scenario_name, seed):
+        """
+        Build the KPI log filename.
+
+        If csv_path is provided (the normal play/eval case), put the KPI
+        log next to it with a `kpi_log_` prefix and the original base
+        name, so all artifacts of one run share a stem and one file holds
+        every episode.
+
+        If csv_path is None (legacy call path), fall back to the original
+        timestamped name so nothing else breaks.
+        """
+        if csv_path:
+            base = os.path.splitext(os.path.basename(csv_path))[0]
+            directory = os.path.dirname(os.path.abspath(csv_path)) or "."
+            return os.path.join(directory, f"kpi_log_{base}.csv")
+
+        scenario_part = f"scenario_{scenario_name}_" if scenario_name else ""
+        seed_part = f"seed_{seed}_" if seed is not None else ""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"kpi_log_{scenario_part}{seed_part}{timestamp}.csv"
+
+    def setup(self, scenario_name=None, seed=None, csv_path=None,
+              episode_idx=0, kpi_log_path=None):
         self.HIGH_FREQ = 2
         self.SHIFT_DURATION = shift_dura
         self.HOUR = 60  # Assuming time units are in minutes
         self.last_high_freq_update = 0
         self.last_shift_update = 0
         self.last_hour_update = 0
-        
-        # Build filename with scenario and seed
-        scenario_part = f"scenario_{scenario_name}_" if scenario_name else ""
-        seed_part = f"seed_{seed}_" if seed is not None else ""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.csv_filename = f'kpi_log_{scenario_part}{seed_part}{timestamp}.csv'
-        self.file_exists = os.path.exists(self.csv_filename)
+
+        self.episode_idx = episode_idx
+        self.scenario_name = scenario_name if scenario_name is not None else ""
+        self.seed = seed if seed is not None else ""
+
+        # Explicit kpi_log_path wins (results_paths.py convention);
+        # otherwise derive from csv_path (legacy); otherwise timestamped.
+        if kpi_log_path:
+            self.csv_filename = kpi_log_path
+        else:
+            self.csv_filename = self._derive_kpi_path(csv_path, scenario_name, seed)
+        self.file_exists = os.path.exists(self.csv_filename) and os.path.getsize(self.csv_filename) > 0
         self.shift_counter = 0
-        
-        # Initialize hourly tracking
+
         self.last_hour_trips = 0
         self.last_hour_volume = 0
         self.trips_per_hour = 0
         self.volume_per_hour = 0
-        
-        # Initialize equipment state tracking with more detailed states
+
         self.shovel_states = {shovel.name(): {'state': 'operational', 'last_state_change': 0} 
                             for shovel in shovels}
         self.truck_states = {truck.name(): {'state': 'operational', 'last_state_change': 0} 
                            for truck in truck}
-        
-        # Initialize queue monitors
+
         self.shovel_monitors = {
             shovel.name(): {'queue': shovel.requesters()} for shovel in shovels
         }
@@ -1393,25 +1473,13 @@ class KPICalculator(sim.Component):
             dump.name(): {'queue': dump.requesters()} for dump in dumps
         }
 
-        self.headers = [
-            'Timestamp',
-            'Shift_Number',
-            'Shovel_Queue_Lengths',
-            'Crusher_Queue_Lengths', 
-            'Dump_Queue_Lengths',
-            'Changed_Shovel',
-            'New_State',
-            'Changed_Truck',
-            'New_State_Truck',
-            'Trips_Per_Hour',
-            'Production_Volume_Per_Hour',
-            'Total_Production_Volume',
-            'Cost_Per_Ton',
-            'Total_Fuel_Consumption'
-        ]
-        
+        self.headers = list(self.HEADERS_BASE)
+
         if RL_sched:
-            self.headers.insert(5, 'Immediate_Reward')
+            # match original ordering: Immediate_Reward after the state
+            # change cols, Shift_Reward at the end.
+            insert_at = self.headers.index('Changed_Shovel')
+            self.headers.insert(insert_at, 'Immediate_Reward')
             self.headers.append('Shift_Reward')
         
         if not self.file_exists:
@@ -1423,27 +1491,23 @@ class KPICalculator(sim.Component):
         
         current_hour = self.env.now() // self.HOUR
         if current_hour > self.last_hour_update // self.HOUR:
-            # Calculate trips in the last hour
             current_trips = total_trips
             self.trips_per_hour = current_trips - self.last_hour_trips
             self.last_hour_trips = current_trips
-            
-            # Calculate production volume in the last hour
+
             current_volume = total_crush_trips * load_per_trip
             self.volume_per_hour = current_volume - self.last_hour_volume
             self.last_hour_volume = current_volume
-            
+
             self.last_hour_update = self.env.now()
-        
+
         return {
             'Trips_Per_Hour': self.trips_per_hour,
             'Production_Volume_Per_Hour': self.volume_per_hour
         }
 
     def is_shovel_broken(self, shovel):
-        """
-        Enhanced check for shovel breakdown state
-        """
+        """Return True if `shovel` is currently broken down."""
         for claimer in shovel.claimers():
             claimer_str = str(claimer).lower()
             if 'breakdownevent' in claimer_str or 'individualshovelbreakdown' in claimer_str:
@@ -1451,13 +1515,11 @@ class KPICalculator(sim.Component):
         return False
 
     def check_equipment_states(self):
-        """
-        Enhanced equipment state monitoring with immediate CSV updates for state changes
-        """
+        """Check every shovel/truck for a state change since last check,
+        writing an immediate CSV row for each transition."""
         current_time = self.env.now()
         changed_equipment = []
-        
-        # Check shovels
+
         for shovel in shovels:
             current_state = 'breakdown' if self.is_shovel_broken(shovel) else 'operational'
             prev_state = self.shovel_states[shovel.name()]['state']
@@ -1490,7 +1552,6 @@ class KPICalculator(sim.Component):
                 self.update_csv(metrics)
                 changed_equipment.append(('shovel', shovel.name(), current_state))
         
-        # Check trucks
         for t in truck:
             current_state = 'breakdown' if t.phase == phase_broken_down else 'operational'
             prev_state = self.truck_states[t.name()]['state']
@@ -1582,21 +1643,35 @@ class KPICalculator(sim.Component):
             return {}
 
     def initialize_csv(self):
-        """Initialize the CSV file with headers"""
-        try:
-            with open(self.csv_filename, 'w', newline='') as file:
-                writer = csv.DictWriter(file, fieldnames=self.headers)
-                writer.writeheader()
-                file.flush()
-            self.file_exists = True
-        except IOError as e:
-            print(f"Error initializing CSV: {e}")
+        """Initialize the CSV file with headers (no-op if already present/non-empty)."""
+        with _KPI_WRITE_LOCK:
+            need_header = (
+                not os.path.exists(self.csv_filename)
+                or os.path.getsize(self.csv_filename) == 0
+            )
+            if not need_header:
+                self.file_exists = True
+                return
+            try:
+                with open(self.csv_filename, 'w', newline='') as file:
+                    writer = csv.DictWriter(file, fieldnames=self.headers)
+                    writer.writeheader()
+                    file.flush()
+                self.file_exists = True
+            except IOError as e:
+                print(f"Error initializing CSV: {e}")
 
     def update_csv(self, metrics):
-        """Update the CSV file with new metrics"""
+        """Append one row to the shared KPI log. Stamps Episode/Scenario/Seed
+        automatically so multi-episode runs can be aggregated by Episode
+        instead of relying on one file per episode."""
+        # always overwrite identity fields -- never trust the caller for these
+        metrics['Episode'] = self.episode_idx
+        metrics['Scenario'] = self.scenario_name
+        metrics['Seed'] = self.seed
         try:
-            with open(self.csv_filename, 'a', newline='') as file:
-                writer = csv.DictWriter(file, fieldnames=self.headers)
+            with _KPI_WRITE_LOCK, open(self.csv_filename, 'a', newline='') as file:
+                writer = csv.DictWriter(file, fieldnames=self.headers, extrasaction='ignore')
                 if os.path.getsize(self.csv_filename) == 0:
                     writer.writeheader()
                 writer.writerow(metrics)
@@ -1645,57 +1720,69 @@ class KPICalculator(sim.Component):
 
 
 
-def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None, episode_seed=None, scenario_overrides=None, csv_path=None, scenario_name=None, play_seed=None):
+@_with_runDes_lock
+def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None, episode_seed=None, scenario_overrides=None, csv_path=None, scenario_name=None, play_seed=None, channel=None, episode_idx=0, kpi_log_path=None):
 
     global file_path
     global env, shovels, truck, dumps, crushers
     global shovel_idle_times, shovel_last_check, shovel_animations
     global RL_sched, def_schdlr_choice, all_trk_shv_dec, epsilon
+    global rl_decision_index
     global cfg_samp
     global Num_trucks, Num_shovels, Num_crushers, Num_dumps
     global shift_dura, targ_pvol, load_per_trip, choice
-    global total_trips, total_crush_trips
+    global total_trips, total_crush_trips, episode_shovel_choices, episode_queue_sum, episode_queue_count
+    global broken_shovel_dispatch_count
     global truck_trip_counts, truck_phases, truck_last_trip_times
     global shovel_wait_time_tracker
     global trip_times, shovel_queues
     global r_imm_d_pt, terminated, pvol, sim_exit
+    global _channel
 
-    if csv_path is None:
-        raise ValueError("csv_path must be explicitly provided to runDes")
+    # For RL runs the GymEnv passes a StepChannel; for classical/rule-based
+    # runs it stays None and every channel hook in this module is inert.
+    _channel = channel
 
+    # csv_path is kept only for backward-compatible call signatures and
+    # KPI-output naming; no longer used for RL<->DES communication.
     file_path = csv_path
 
-    # ========================================================================
-    # STEP 1: Reset Truck class variables FIRST
-    # ========================================================================
+    # 1. Reset Truck class variables first.
     Truck.trucks_to_fail = None
     Truck.trucks_failed = 0
 
     previous_episode_count = getattr(cfg_samp, 'episode_count', 0)
-    # ========================================================================
-    # STEP 2: ALWAYS reinitialize ConfigSampler (not just for overrides)
-    # ========================================================================
+    # 2. Always reinitialize ConfigSampler (not just for overrides).
     cfg_samp = ConfigSampler('config_extend_review.txt', 
                              scenario_overrides=scenario_overrides)
 
-     # =====  DEBUG CODE =====
-    if scenario_overrides:
-        print(f"\n=== Scenario Overrides Active ===")
-        print(f"Overrides: {scenario_overrides}")
-    # ===== END DEBUG CODE =====
+    # episode_count is a bolted-on attribute, not part of ConfigSampler's
+    # class definition, so the fresh instance above starts without it
+    # every episode; restore it here so it actually accumulates (the
+    # increment at episode end is unchanged).
+    cfg_samp.episode_count = previous_episode_count
 
-    # ========================================================================
-    # STEP 3: Initialize fresh episodic parameters for this episode
-    # ========================================================================
+    if scenario_overrides and _DES_VERBOSE:
+        print(f"Scenario overrides active: {scenario_overrides}")
+
+    # 3. Initialize fresh episodic parameters for this episode.
     cfg_samp.new_episode(episode_seed)
-    # Store scenario and seed for KPI filename
+
+    # Seed the global `random`/`np.random` modules for this episode: they
+    # drive the per-event coin flips (epsilon crusher/dump split, which
+    # trucks/shovels pre-fail, unconstrained destination choice, breakdown
+    # jitter/repair variation). cfg_samp.new_episode() only seeds
+    # ConfigSampler's own RNG, not these -- seeding here makes runDes
+    # self-sufficient for reproducibility regardless of entry point.
+    if episode_seed is not None:
+        random.seed(episode_seed)
+        np.random.seed(episode_seed % (2**32))
+
     global current_scenario, current_seed
     current_scenario = scenario_name if scenario_name else "default"
-    current_seed = play_seed if play_seed is not None else (episode_seed if episode_seed is not None else 0)
+    current_seed = episode_seed if episode_seed is not None else (play_seed if play_seed is not None else 0)
 
-    # ========================================================================
-    # STEP 4: Sample ALL parameters BEFORE using them
-    # ========================================================================
+    # 4. Sample all parameters before using them.
     Num_trucks = int(cfg_samp.get_sampled_value('TR'))
     Num_shovels = int(cfg_samp.get_sampled_value('SH'))
     Num_crushers = int(cfg_samp.get_sampled_value('CR')) 
@@ -1706,11 +1793,13 @@ def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None, episode_see
     choice = int(cfg_samp.get_sampled_value('scheduler_choice'))
     epsilon = cfg_samp.get_sampled_value('Eps')
 
-    # ========================================================================
-    # STEP 5: Reset all counters and state dictionaries
-    # ========================================================================
+    # 5. Reset all counters and state dictionaries.
     total_trips = 0
     total_crush_trips = 0
+    broken_shovel_dispatch_count = 0
+    episode_shovel_choices = {}
+    episode_queue_sum = 0.0
+    episode_queue_count = 0
     truck_trip_counts = {}
     truck_phases = {}
     truck_last_trip_times = {}
@@ -1718,20 +1807,20 @@ def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None, episode_see
     r_imm_d_pt = None          
     terminated = False         
     pvol = 0 
+    rl_decision_index = 0
 
-    # ========================================================================
-    # STEP 6: NOW create deques and trackers with correct sizes
-    # ========================================================================
+    # 6. Create deques/trackers now that sizes are known.
     all_trk_shv_dec = deque(maxlen=Num_trucks * 2)
     shovel_wait_time_tracker = ShovelWaitTimeTracker(Num_shovels)
-    
-    # Reset rolling reward windows
-    trip_times.clear()
-    shovel_queues.clear()
 
-    # ========================================================================
-    # STEP 7: Print episode summary and continue with rest of function
-    # ========================================================================
+    # Rebound (not cleared in-place) so a concurrent eval-thread runDes
+    # can't reach into this thread's RewardCalculator.trip_times/
+    # shovel_queues and wipe its sliding-window data mid-episode -- each
+    # episode gets a private deque pair no other thread holds a handle to.
+    trip_times = deque(maxlen=k)
+    shovel_queues = deque(maxlen=k)
+
+    # 7. Print episode summary and continue.
     print_episode_summary()
 
     if flag_RL_sched:
@@ -1740,7 +1829,7 @@ def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None, episode_see
         print("="*70 + "\n")
 
     shovel_animations = {}
-    env = sim.Environment(trace=False, time_unit='minutes') #set simulation to work in minutes
+    env = sim.Environment(trace=False, time_unit='minutes')
     env.animate(False)
     env.width(1280)
     env.height(1024)
@@ -1763,7 +1852,13 @@ def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None, episode_see
     breakdown_manager.activate()
 
     # Create the KPI calculator component
-    #kpi_calculator = KPICalculator(scenario_name=current_scenario, seed=current_seed)
+    kpi_calculator = KPICalculator(
+        scenario_name=current_scenario,
+        seed=current_seed,
+        csv_path=csv_path,
+        episode_idx=episode_idx,
+        kpi_log_path=kpi_log_path,
+    )
 
 
     # Animation display setup------------------------------------------------------------------
@@ -1772,8 +1867,6 @@ def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None, episode_see
     env.AnimateText(text=time_display, x=800, y=50, fontsize=20, textcolor = "white") #Display time
     env.background_color(("#eeffcc"))
 
-    #Display config parameters 
-    #sim.AnimateText(text=config_display(config), x=10, y=80, text_anchor='w', fontsize=12, textcolor='white' )
 
     # Dictionary to track idle times for each shovel
     shovel_idle_times = {shovel.name(): 0 for shovel in shovels}
@@ -1854,33 +1947,76 @@ def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None, episode_see
     sim_exit = True
     
   
-    #trips_cal = total_trips - total_dump_trips
-    #trips_cal = np.clip (trips_cal, 0, 1000, out=None)
-    pvol = total_crush_trips * load_per_trip #Calculate total production volume for the shift 
+    pvol = total_crush_trips * load_per_trip
     wvol = max(total_trips - total_crush_trips, 0) * load_per_trip
-  
-    # Calculate final diversity score (e.g., as the diversity of the entire deque history)
-    final_diversity_score = diversity_score()
 
     if RL_sched  == True:
-        prod_ratio = min(1.0, pvol/targ_pvol)  # Calculate production ratio (scaled between 0-1)
-        bonus = 0.0
+        prod_ratio = min(1.0, pvol/targ_pvol)
 
-        final_diversity = diversity_score()
+        # Informational state for the agent / play-mode logging only
+        # (Fleet_Diversity, DivScore in the terminal info); not part of
+        # the reward.
+        final_diversity_score = diversity_score()
 
 
-        if prod_ratio >= 0.95 and final_diversity > 0.65:
-            bonus = 0.5
-        elif prod_ratio >= 0.90 and final_diversity > 0.50:
-            bonus = 0.2
+        EPI_PROD_W = 30.0
+        b1, b2 = 10.0, 4.0
+        th1, th2 = 0.80, 0.65
+        phi1, phi2 = 0.65, 0.50  # light final-diversity gate (kept modest)
+
+        if prod_ratio >= th1 and final_diversity_score > phi1:
+            perf_bonus = b1
+        elif prod_ratio >= th2 and final_diversity_score > phi2:
+            perf_bonus = b2
         else:
-            bonus = 0.0
+            perf_bonus = 0.0
 
-        # Balance the components with appropriate weights
-        r_epi = 0.4 * prod_ratio - 0.6*( 1- final_diversity) + bonus 
+        r_epi = EPI_PROD_W * prod_ratio + perf_bonus
+
+
+        _total_choices = sum(episode_shovel_choices.values())
+        if _total_choices > 0 and Num_shovels and Num_shovels > 0:
+            _counts = list(episode_shovel_choices.values())
+            max_shovel_share = round(max(_counts) / _total_choices, 5)
+            _probs = [c / _total_choices for c in _counts]
+            _entropy = -sum(p * np.log2(p + 1e-12) for p in _probs)
+            _max_entropy = np.log2(Num_shovels)
+            shovel_sel_entropy = round(_entropy / _max_entropy, 5) if _max_entropy > 0 else 0.0
+            unused_shovels = int(Num_shovels - len(episode_shovel_choices))
+        else:
+            max_shovel_share = ""
+            shovel_sel_entropy = ""
+            unused_shovels = ""
 
         print('\n **** ')
-        print("pvol: {}, r_epi: {}, total_trips: {}, load_per_trip: {}, r_imm_d_pt: {}, targ_pvol: {}".format(pvol, r_epi, total_trips, load_per_trip, r_imm_d_pt, targ_pvol))
+        print("pvol: {}, r_epi: {}, prod_ratio: {}, perf_bonus: {}, total_trips: {}, "
+              "max_shovel_share: {}, shovel_sel_entropy: {}, targ_pvol: {}".format(
+                  pvol, r_epi, prod_ratio, perf_bonus, total_trips,
+                  max_shovel_share, shovel_sel_entropy, targ_pvol))
+        if broken_shovel_dispatch_count > 0:
+            print(f"WARNING: {broken_shovel_dispatch_count} dispatch(es) to a broken "
+                  f"shovel this episode -- action masking may not be active.")
+
+        # Append this episode's metrics to a live-trackable CSV (separate
+        # file per csv_path/scenario name so train/test/eval runs don't mix).
+        # See episode_metrics_logger.py.
+        try:
+            metrics_path = (os.path.splitext(str(file_path))[0] + "_episode_metrics.csv"
+                             if file_path else "episode_metrics.csv")
+            log_episode_metrics(
+                csv_path=metrics_path,
+                episode=cfg_samp.episode_count if hasattr(cfg_samp, 'episode_count') else None,
+                pvol=pvol, targ_pvol=targ_pvol, prod_ratio=prod_ratio, r_epi=r_epi,
+                total_trips=total_trips, total_crush_trips=total_crush_trips,
+                broken_shovel_dispatch_count=broken_shovel_dispatch_count,
+                scenario_name=scenario_name,
+                max_shovel_share=max_shovel_share,
+                shovel_sel_entropy=shovel_sel_entropy,
+                unused_shovels=unused_shovels,
+            )
+        except Exception as e:
+            # Never let logging failures interrupt the simulation.
+            print(f"WARNING: could not write episode metrics log: {e}")
 
         # Get all truck data
         all_truck_data = print_trip_counts(ppflag=0)
@@ -1906,15 +2042,43 @@ def runDes(fsim=True, flag_RL_sched=True, fdef_schdlr_choice = None, episode_see
                                    print_resource_status(pflag=0)['Shovels'],
                                    terminal_truck_data, fleet_summary)  # ← Now passes 1 truck
     
-        info = {'PVOL': pvol, 'DivScore': final_diversity_score}
+        # Terminal info dict. PVOL/DivScore kept for backward compatibility;
+        # prod_ratio and mean_queue let an external eval callback read
+        # operational quality straight off info at episode end. mean_queue
+        # is the average queue length at the chosen shovel across this
+        # episode's RL decisions -- a direct measure of dispatch quality.
+        mean_queue_this_ep = (episode_queue_sum / episode_queue_count
+                               if episode_queue_count > 0 else 0.0)
+        info = {
+            'PVOL': pvol,
+            'DivScore': final_diversity_score,
+            'prod_ratio': prod_ratio,
+            'mean_queue': mean_queue_this_ep,
+        }
         final_step_update(observ, r_epi, info)
         print("Current observ: "+str(observ))
-        #return pvol
-        # Increment episode count for tracking
-        cfg_samp.episode_count += 1
-        sys.exit()
+
+        # Log a synchronicity summary, then return so the DES worker
+        # thread ends cleanly (as a thread, not a process, we must return
+        # rather than sys.exit()).
+        if _channel is not None:
+            _channel.episode_summary()
+
+        # Release the salabim env (memory hygiene): `env` is a module
+        # global reassigned at the top of the next runDes() call, but for
+        # this daemon thread's lifetime it still pins the entire previous
+        # episode's object graph (components, events, trajectories,
+        # animation handles). Setting it to None here releases that graph
+        # immediately rather than waiting for reassignment, which matters
+        # over many back-to-back episodes in a long training run. Safe:
+        # anything that still needs these has finished by the time we
+        # return.
+        env = None
+        shovels = None
+        truck = None
+        dumps = None
+        crushers = None
+        shovel_animations = None
+        return
     elif RL_sched  == False:
         return pvol
-
-
-   
